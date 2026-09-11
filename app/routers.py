@@ -4,23 +4,46 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models.contest_performance import ContestPerformance
+from app.models.hint_message import HintMessage
+from app.models.hint_session import HintSession
 from app.models.platform_link import PlatformLink
 from app.models.problem import Problem
+from app.models.problem_knowledge import ProblemKnowledge
 from app.models.submission import Submission
 from app.models.user import User
+from app.models.user_analytics import UserAnalytics
 from app.schemas import (
+    AnalyticsRecomputeResponse,
+    AnalyticsSummaryResponse,
+    ContestMetricsResponse,
     ContestPerformanceResponse,
+    DifficultyBucket,
+    DifficultyDistributionResponse,
+    HintMessageResponse,
+    HintSessionDetailResponse,
+    KnowledgeExtractRequest,
+    KnowledgeVerifyRequest,
     PlatformLinkCreate,
     PlatformLinkResponse,
+    ProblemKnowledgeResponse,
     ProblemResponse,
+    SessionConcludeRequest,
+    SessionCreateRequest,
+    SessionMessageRequest,
+    SessionMessageResponse,
     SubmissionResponse,
     SyncTriggerResponse,
+    TopicAnalyticsResponse,
     UserCreate,
     UserResponse,
 )
+from app.services.analytics import AnalyticsService
+from app.services.coach import CoachService
+from app.services.editorial import EditorialService, resolve_coach_mode
 from app.services.sync import CodeforcesSyncService, SyncAlreadyRunningError
 
 router = APIRouter(prefix="/api")
@@ -95,10 +118,10 @@ async def get_platform_status(link_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/platforms/{link_id}/sync", response_model=SyncTriggerResponse)
-async def trigger_platform_sync(link_id: int):
+async def trigger_platform_sync(link_id: int, force_full: bool = Query(False)):
     sync_service = CodeforcesSyncService()
     try:
-        stats = await sync_service.sync_link(link_id)
+        stats = await sync_service.sync_link(link_id, force_full=force_full)
         return SyncTriggerResponse(
             status="completed",
             link_id=link_id,
@@ -173,3 +196,274 @@ async def list_problems(
     stmt = stmt.order_by(Problem.id.asc()).offset(offset).limit(limit)
     res = await db.execute(stmt)
     return list(res.scalars().all())
+
+
+# ── Analytics ─────────────────────────────────────────────────────────
+@router.post("/analytics/{user_id}/recompute", response_model=AnalyticsRecomputeResponse)
+async def recompute_analytics(user_id: int, db: AsyncSession = Depends(get_db)):
+    user_res = await db.execute(select(User).where(User.id == user_id))
+    if not user_res.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="User not found")
+
+    analytics_service = AnalyticsService()
+    record = await analytics_service.recompute_user_analytics(user_id)
+    return AnalyticsRecomputeResponse(
+        status="success",
+        user_id=record.user_id,
+        computed_at=record.computed_at,
+        total_problems_solved=record.total_problems_solved,
+        total_problems_attempted=record.total_problems_attempted,
+        strengths=record.strengths,
+        weaknesses=record.weaknesses,
+        stale_topics=record.stale_topics,
+    )
+
+
+@router.get("/analytics/{user_id}/summary", response_model=AnalyticsSummaryResponse)
+async def get_analytics_summary(user_id: int, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
+    record = res.scalar_one_or_none()
+    if not record:
+        # Check user existence
+        u_res = await db.execute(select(User).where(User.id == user_id))
+        if not u_res.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="User not found")
+        # Automatically compute if never computed
+        analytics_service = AnalyticsService()
+        record = await analytics_service.recompute_user_analytics(user_id)
+
+    overall_completion = (
+        round(record.total_problems_solved / record.total_problems_attempted, 4)
+        if record.total_problems_attempted > 0 else 0.0
+    )
+    overall_efficiency = (
+        round(record.total_problems_solved / record.total_submissions, 4)
+        if record.total_submissions > 0 else 0.0
+    )
+
+    return AnalyticsSummaryResponse(
+        user_id=record.user_id,
+        computed_at=record.computed_at,
+        total_problems_solved=record.total_problems_solved,
+        total_problems_attempted=record.total_problems_attempted,
+        total_submissions=record.total_submissions,
+        overall_completion_rate=overall_completion,
+        overall_efficiency=overall_efficiency,
+        strengths=record.strengths,
+        weaknesses=record.weaknesses,
+        stale_topics=record.stale_topics,
+        contest_summary=record.contest_metrics,
+    )
+
+
+@router.get("/analytics/{user_id}/topics", response_model=List[TopicAnalyticsResponse])
+async def get_topic_analytics(
+    user_id: int,
+    min_samples: int = Query(1, ge=0),
+    sort_by: str = Query("level", pattern="^(level|freshness|completion|name)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    db: AsyncSession = Depends(get_db),
+):
+    res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
+    record = res.scalar_one_or_none()
+    if not record:
+        u_res = await db.execute(select(User).where(User.id == user_id))
+        if not u_res.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="User not found")
+        analytics_service = AnalyticsService()
+        record = await analytics_service.recompute_user_analytics(user_id)
+
+    topic_dict = record.topic_metrics or {}
+    items: List[TopicAnalyticsResponse] = []
+
+    for tag, metrics in topic_dict.items():
+        if metrics.get("sample_size", 0) >= min_samples:
+            items.append(TopicAnalyticsResponse(tag=tag, **metrics))
+
+    reverse = (order == "desc")
+    if sort_by == "level":
+        items.sort(key=lambda x: (x.demonstrated_level or 0, x.sample_size), reverse=reverse)
+    elif sort_by == "freshness":
+        items.sort(key=lambda x: (x.freshness_days if x.freshness_days is not None else 999999), reverse=reverse)
+    elif sort_by == "completion":
+        items.sort(key=lambda x: x.solve_completion_rate, reverse=reverse)
+    elif sort_by == "name":
+        items.sort(key=lambda x: x.tag, reverse=reverse)
+
+    return items
+
+
+@router.get("/analytics/{user_id}/difficulty", response_model=DifficultyDistributionResponse)
+async def get_difficulty_distribution(user_id: int, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
+    record = res.scalar_one_or_none()
+    if not record:
+        u_res = await db.execute(select(User).where(User.id == user_id))
+        if not u_res.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="User not found")
+        analytics_service = AnalyticsService()
+        record = await analytics_service.recompute_user_analytics(user_id)
+
+    dist_map = record.difficulty_distribution or {}
+    buckets = [
+        DifficultyBucket(rating_range=k, count=v)
+        for k, v in dist_map.items()
+    ]
+    return DifficultyDistributionResponse(user_id=user_id, buckets=buckets)
+
+
+@router.get("/analytics/{user_id}/contests", response_model=ContestMetricsResponse)
+async def get_contest_analytics(user_id: int, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
+    record = res.scalar_one_or_none()
+    if not record:
+        u_res = await db.execute(select(User).where(User.id == user_id))
+        if not u_res.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="User not found")
+        analytics_service = AnalyticsService()
+        record = await analytics_service.recompute_user_analytics(user_id)
+
+    cm = record.contest_metrics or {}
+    return ContestMetricsResponse(
+        user_id=user_id,
+        current_rating=cm.get("current_rating"),
+        max_rating=cm.get("max_rating"),
+        contest_count=cm.get("contest_count", 0),
+        best_rank=cm.get("best_rank"),
+        avg_rank=cm.get("avg_rank"),
+        avg_delta=cm.get("avg_delta"),
+        rating_volatility=cm.get("rating_volatility"),
+        recent_contests=cm.get("recent_contests", []),
+    )
+
+
+# ── Phase 3 Editorial Knowledge Endpoints ─────────────────────────────
+@router.post("/knowledge/extract", response_model=ProblemKnowledgeResponse, status_code=status.HTTP_201_CREATED)
+async def extract_problem_knowledge(payload: KnowledgeExtractRequest, db: AsyncSession = Depends(get_db)):
+    prob_q = select(Problem).where(Problem.id == payload.problem_id)
+    prob = (await db.execute(prob_q)).scalar_one_or_none()
+    if not prob:
+        raise HTTPException(status_code=404, detail=f"Problem id={payload.problem_id} not found")
+
+    editorial_service = EditorialService()
+    if payload.editorial_text:
+        knowledge = await editorial_service.ingest_editorial(
+            problem_id=payload.problem_id,
+            raw_editorial=payload.editorial_text,
+            editorial_url=payload.editorial_url,
+        )
+    elif payload.editorial_url:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(payload.editorial_url)
+                r.raise_for_status()
+                html_text = r.text
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch editorial from URL: {e}")
+
+        knowledge = await editorial_service.ingest_editorial(
+            problem_id=payload.problem_id,
+            raw_editorial=html_text,
+            editorial_url=payload.editorial_url,
+        )
+    else:
+        knowledge = await editorial_service.generate_knowledge_fallback(payload.problem_id)
+
+    coach_mode = resolve_coach_mode(knowledge)
+    resp = ProblemKnowledgeResponse.model_validate(knowledge)
+    resp.coach_mode = coach_mode
+    return resp
+
+
+@router.get("/knowledge/{problem_id}", response_model=ProblemKnowledgeResponse)
+async def get_problem_knowledge(problem_id: int, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(ProblemKnowledge).where(ProblemKnowledge.problem_id == problem_id))
+    knowledge = res.scalar_one_or_none()
+    if not knowledge:
+        raise HTTPException(status_code=404, detail="Knowledge record not found for this problem")
+
+    coach_mode = resolve_coach_mode(knowledge)
+    resp = ProblemKnowledgeResponse.model_validate(knowledge)
+    resp.coach_mode = coach_mode
+    return resp
+
+
+@router.post("/knowledge/{id}/verify", response_model=ProblemKnowledgeResponse)
+async def verify_problem_knowledge(id: int, payload: KnowledgeVerifyRequest, db: AsyncSession = Depends(get_db)):
+    if payload.status not in ("user_verified", "user_rejected"):
+        raise HTTPException(status_code=400, detail="Status must be 'user_verified' or 'user_rejected'")
+
+    res = await db.execute(select(ProblemKnowledge).where(ProblemKnowledge.id == id))
+    knowledge = res.scalar_one_or_none()
+    if not knowledge:
+        raise HTTPException(status_code=404, detail=f"ProblemKnowledge id={id} not found")
+
+    knowledge.validation_status = payload.status
+    await db.commit()
+
+    coach_mode = resolve_coach_mode(knowledge)
+    resp = ProblemKnowledgeResponse.model_validate(knowledge)
+    resp.coach_mode = coach_mode
+    return resp
+
+
+# ── Phase 3 Socratic Coach Endpoints ─────────────────────────────────
+@router.post("/coach/sessions", response_model=HintSessionDetailResponse, status_code=status.HTTP_201_CREATED)
+async def create_coach_session(payload: SessionCreateRequest):
+    coach_service = CoachService()
+    try:
+        session = await coach_service.create_session(
+            user_id=payload.user_id,
+            problem_id=payload.problem_id,
+        )
+        return session
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/coach/sessions/{session_id}", response_model=HintSessionDetailResponse)
+async def get_coach_session(session_id: int, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(
+        select(HintSession)
+        .options(selectinload(HintSession.messages), selectinload(HintSession.problem))
+        .where(HintSession.id == session_id)
+    )
+    session = res.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail=f"HintSession id={session_id} not found")
+    return session
+
+
+@router.post("/coach/sessions/{session_id}/message", response_model=SessionMessageResponse)
+async def send_coach_message(session_id: int, payload: SessionMessageRequest):
+    coach_service = CoachService()
+    try:
+        coach_msg, updated_session = await coach_service.process_user_message(
+            session_id=session_id,
+            user_message=payload.user_message,
+            current_code=payload.current_code,
+            request_escalation=payload.request_escalation,
+        )
+        return SessionMessageResponse(
+            coach_message=HintMessageResponse.model_validate(coach_msg),
+            current_level=updated_session.current_level,
+            coach_mode=updated_session.coach_mode,
+            user_stated_approach=updated_session.user_stated_approach,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/coach/sessions/{session_id}/conclude", response_model=HintSessionDetailResponse)
+async def conclude_coach_session(session_id: int, payload: SessionConcludeRequest):
+    coach_service = CoachService()
+    try:
+        session = await coach_service.conclude_session(
+            session_id=session_id,
+            outcome=payload.outcome,
+        )
+        return session
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+

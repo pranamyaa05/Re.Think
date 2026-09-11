@@ -45,6 +45,12 @@ class Problem(Base):
     submissions: Mapped[list["Submission"]] = relationship(
         back_populates="problem", cascade="all, delete-orphan"
     )
+    knowledge: Mapped[list["ProblemKnowledge"]] = relationship(
+        back_populates="problem", cascade="all, delete-orphan"
+    )
+    hint_sessions: Mapped[list["HintSession"]] = relationship(
+        back_populates="problem", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return (

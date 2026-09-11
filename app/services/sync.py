@@ -12,7 +12,7 @@ Guarantees:
 
 from datetime import datetime, timedelta, timezone
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 from sqlalchemy import select, text
@@ -104,24 +104,23 @@ class CodeforcesSyncService:
             await session.commit()
             return result.fetchone() is not None
 
-    async def sync_link(self, link_id: int) -> Dict[str, int]:
-        """
-        Orchestrates full Codeforces sync with atomic lease and safety boundaries.
-        Returns statistics: {'submissions_synced': N, 'contests_synced': M, 'problems_upserted': K}
-        """
-        worker_id = f"worker-{uuid.uuid4().hex[:12]}"
+    async def sync_link(
+        self, link_id: int, force_full: bool = False, max_pages: Optional[int] = None
+    ) -> Dict[str, Any]:
+        worker_id = f"worker_{uuid.uuid4().hex[:8]}"
         acquired = await self.acquire_lease(link_id, worker_id)
         if not acquired:
-            raise SyncAlreadyRunningError(f"Sync is already in progress for link {link_id}")
+            raise SyncAlreadyRunningError(
+                f"Sync lease could not be acquired for platform link {link_id}."
+            )
 
-        # Fetch handle and user_id safely
+        # Retrieve link details
         async with async_session_factory() as session:
-            result = await session.execute(
+            res = await session.execute(
                 select(PlatformLink).where(PlatformLink.id == link_id)
             )
-            link = result.scalar_one_or_none()
+            link = res.scalar_one_or_none()
             if not link:
-                await self.release_lease(link_id, worker_id, status="failed", error="Link not found")
                 raise ValueError(f"PlatformLink {link_id} not found")
             user_id = link.user_id
             handle = link.handle
@@ -131,7 +130,9 @@ class CodeforcesSyncService:
             raw_contests = await self.adapter.get_user_rating(handle)
 
             # 2. Synchronize submissions via stop-on-overlap pagination (OUTSIDE DB transaction per page)
-            synced_subs, upserted_problems = await self._sync_submissions(user_id, handle)
+            synced_subs, upserted_problems = await self._sync_submissions(
+                user_id, handle, max_pages=max_pages, check_overlap=not force_full
+            )
 
             # 3. Persist contest performances (idempotent upsert)
             synced_contests = await self._persist_contests(user_id, raw_contests)
@@ -140,6 +141,14 @@ class CodeforcesSyncService:
             released = await self.release_lease(link_id, worker_id, status="synced")
             if not released:
                 logger.warning(f"Lease fence expired or stolen for worker {worker_id} on link {link_id}")
+
+            # 5. Post-sync analytics rebuild hook
+            try:
+                from app.services.analytics import AnalyticsService
+                analytics_service = AnalyticsService()
+                await analytics_service.recompute_user_analytics(user_id)
+            except Exception as e:
+                logger.exception(f"Post-sync analytics rebuild failed for user {user_id}: {e}")
 
             return {
                 "submissions_synced": synced_subs,
@@ -153,20 +162,45 @@ class CodeforcesSyncService:
             raise
 
     async def _sync_submissions(
-        self, user_id: int, handle: str, max_pages: int = 10
+        self,
+        user_id: int,
+        handle: str,
+        max_pages: Optional[int] = None,
+        check_overlap: bool = True,
     ) -> Tuple[int, int]:
         """
         Paginates submissions newest-first.
-        Stops when encountering submissions already known in DB (overlap) or reaches max_pages.
+
+        On first sync (no existing submissions in DB):
+          - Continues fetching until an empty or short (< page_size) page is returned.
+          - No arbitrary 10-page limit.
+
+        On subsequent syncs:
+          - Stop-on-overlap optimization: terminates as soon as any submission on the
+            page already exists in the database (len(existing_ids) > 0), after safely
+            persisting any new submissions that appeared on that boundary page.
+
+        Infinite-loop protection:
+          - Detects API cycles (if all IDs on a page have already been seen in this sync run).
+          - Checks for empty or short pages.
+          - Supports optional max_pages parameter if an explicit upper bound is passed.
         """
         page_size = settings.sync_page_size
         from_index = 1
         total_synced_subs = 0
         total_upserted_problems = 0
         page_count = 0
+        seen_sync_sub_ids: Set[int] = set()
 
-        while page_count < max_pages:
+        while True:
+            if max_pages is not None and page_count >= max_pages:
+                logger.warning(
+                    f"Reached explicit max_pages limit ({max_pages}) during submission sync for handle '{handle}'."
+                )
+                break
+
             page_count += 1
+
             # API call outside DB session
             submissions_page = await self.adapter.get_user_status(
                 handle=handle, from_index=from_index, count=page_size
@@ -178,7 +212,16 @@ class CodeforcesSyncService:
             if not sub_ids:
                 break
 
-            # Check for existing IDs to determine overlap
+            # Infinite loop / cycle protection: ensure the API is returning fresh IDs
+            if all(sid in seen_sync_sub_ids for sid in sub_ids):
+                logger.warning(
+                    f"API cycle detected for handle '{handle}': all submission IDs on page {page_count} "
+                    f"(from_index={from_index}) were already seen in this sync run. Terminating pagination."
+                )
+                break
+            seen_sync_sub_ids.update(sub_ids)
+
+            # Check for existing IDs in the database to detect overlap with prior syncs
             async with async_session_factory() as session:
                 existing_res = await session.execute(
                     select(Submission.platform_sub_id).where(
@@ -189,11 +232,11 @@ class CodeforcesSyncService:
                 )
                 existing_ids: Set[int] = set(existing_res.scalars().all())
 
-            # Filter out already existing submissions
+            # Filter out already existing submissions (handles boundary page with mix of new and existing)
             new_submissions = [sub for sub in submissions_page if sub["id"] not in existing_ids]
 
             if new_submissions:
-                # Step A: Upsert problems for these submissions first (FK dependency)
+                # Step A: Upsert problems for these new submissions first (FK dependency)
                 prob_count = await self._upsert_problems_from_submissions(new_submissions)
                 total_upserted_problems += prob_count
 
@@ -201,11 +244,14 @@ class CodeforcesSyncService:
                 inserted_count = await self._persist_submissions(user_id, new_submissions)
                 total_synced_subs += inserted_count
 
-            # If any item in the page was already known, we have reached the overlap!
-            if len(existing_ids) > 0 or len(submissions_page) < page_size:
+            # Termination conditions:
+            # 1. Overlap reached: if check_overlap is True and at least one submission on this page
+            #    already existed in the DB, we have caught up with previously synced history.
+            # 2. Final short page: if the page has fewer items than page_size, we reached the end of history.
+            if (check_overlap and len(existing_ids) > 0) or len(submissions_page) < page_size:
                 break
 
-            from_index += page_size
+            from_index += len(submissions_page)
 
         return total_synced_subs, total_upserted_problems
 

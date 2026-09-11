@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     sync_lease_minutes: int = 15
     sync_page_size: int = 100
 
+    # ── LLM Settings ──────────────────────────────────────────────────────
+    llm_provider: str = "mock"  # "mock" | "gemini" | "openai"
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-1.5-flash"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+
 
 # Singleton — import this everywhere
 settings = Settings()

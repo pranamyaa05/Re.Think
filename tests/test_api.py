@@ -56,3 +56,47 @@ async def test_platform_link_and_status():
         assert st_res.status_code == 200
         assert st_res.json()["handle"] == "tourist"
 
+
+@pytest.mark.asyncio
+async def test_analytics_endpoints():
+    username = f"analytics_user_{uuid.uuid4().hex[:8]}"
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        u_res = await ac.post("/api/users", json={"username": username})
+        assert u_res.status_code == 201
+        user_id = u_res.json()["id"]
+
+        # 1. Recompute on new user (0 solves)
+        rec_res = await ac.post(f"/api/analytics/{user_id}/recompute")
+        assert rec_res.status_code == 200
+        rec_data = rec_res.json()
+        assert rec_data["user_id"] == user_id
+        assert rec_data["total_problems_solved"] == 0
+        assert rec_data["status"] == "success"
+
+        # 2. Get summary
+        sum_res = await ac.get(f"/api/analytics/{user_id}/summary")
+        assert sum_res.status_code == 200
+        sum_data = sum_res.json()
+        assert sum_data["user_id"] == user_id
+        assert sum_data["total_problems_solved"] == 0
+        assert "contest_summary" in sum_data
+
+        # 3. Get topics
+        top_res = await ac.get(f"/api/analytics/{user_id}/topics?min_samples=0")
+        assert top_res.status_code == 200
+        assert isinstance(top_res.json(), list)
+
+        # 4. Get difficulty
+        diff_res = await ac.get(f"/api/analytics/{user_id}/difficulty")
+        assert diff_res.status_code == 200
+        assert "buckets" in diff_res.json()
+
+        # 5. Get contests
+        cont_res = await ac.get(f"/api/analytics/{user_id}/contests")
+        assert cont_res.status_code == 200
+        assert cont_res.json()["contest_count"] == 0
+
+        # 6. Non-existent user returns 404
+        bad_res = await ac.get("/api/analytics/999999/summary")
+        assert bad_res.status_code == 404
+
