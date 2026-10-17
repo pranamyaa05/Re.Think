@@ -33,6 +33,12 @@ class User(Base):
     hint_sessions: Mapped[list["HintSession"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    recommendations: Mapped[list["Recommendation"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
+    reflections: Mapped[list["Reflection"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username='{self.username}')>"

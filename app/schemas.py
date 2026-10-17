@@ -23,6 +23,7 @@ class PlatformLinkCreate(BaseModel):
     user_id: int
     platform: str = "codeforces"
     handle: str
+    auth_token: Optional[str] = None
 
 
 class PlatformLinkResponse(BaseModel):
@@ -91,6 +92,7 @@ class ProblemResponse(BaseModel):
     problem_index: Optional[str] = None
     title: str
     rating: Optional[int] = None
+    difficulty_label: Optional[str] = None
     tags: Optional[List[str]] = None
     solved_count: int
     url: Optional[str] = None
@@ -236,6 +238,62 @@ class SessionMessageResponse(BaseModel):
     user_stated_approach: Optional[str] = None
 
 
+
 class SessionConcludeRequest(BaseModel):
     outcome: str  # solved | gave_up
 
+
+# ── Phase 4: Recommendations ─────────────────────────────────────────────────
+
+class ProblemSummary(BaseModel):
+    id: int
+    platform_id: str
+    title: str
+    rating: Optional[int] = None
+    tags: List[str] = []
+    url: Optional[str] = None
+
+
+class RecommendationResponse(BaseModel):
+    status: str  # 'problem' | 'study' | 'insufficient_data' | 'no_candidates'
+    recommendation_id: Optional[int] = None
+    topic: Optional[str] = None
+    reason: Optional[str] = None
+    problem: Optional[ProblemSummary] = None
+    resource_url: Optional[str] = None
+
+
+class RecommendationListItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    recommendation_type: str
+    topic: str
+    reason: str
+    status: str
+    created_at: datetime
+    target_rating_min: Optional[int] = None
+    target_rating_max: Optional[int] = None
+    problem: Optional[ProblemSummary] = None
+
+
+class DismissResponse(BaseModel):
+    status: str
+    recommendation_id: Optional[int] = None
+
+
+# ── Phase 4: Reflections ──────────────────────────────────────────────────────
+
+class ReflectionData(BaseModel):
+    id: int
+    user_id: int
+    date: str
+    content: str
+    metrics: dict
+    generated_at: Optional[str] = None
+
+
+class ReflectionResponse(BaseModel):
+    status: str  # 'generated' | 'existing' | 'skipped'
+    reflection: Optional[ReflectionData] = None
+    reason: Optional[str] = None

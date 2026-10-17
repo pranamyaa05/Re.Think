@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, func
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -27,6 +27,7 @@ class LLMCallLog(Base):
     tokens_in: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     tokens_out: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    rejection_details: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

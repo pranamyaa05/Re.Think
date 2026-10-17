@@ -8,7 +8,7 @@ long-running platform API syncs.
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -28,6 +28,7 @@ class PlatformLink(Base):
         String(20), nullable=False  # 'codeforces'
     )
     handle: Mapped[str] = mapped_column(String(100), nullable=False)
+    auth_token: Mapped[Optional[str]] = mapped_column(Text, default=None)
 
     # ── Sync state ────────────────────────────────────────────────────────
     # last_synced_at: when the most recent successful sync completed.

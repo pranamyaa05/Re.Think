@@ -1,5 +1,5 @@
 """
-Core synchronization service for Codeforces.
+Core synchronization service for Codeforces and LeetCode.
 
 Guarantees:
 1. Atomic Lease: Non-blocking lease acquisition with timeout recovery.
@@ -12,6 +12,7 @@ Guarantees:
 
 from datetime import datetime, timedelta, timezone
 import logging
+import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
@@ -20,12 +21,14 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.adapters.codeforces import CodeforcesAdapter, CodeforcesAPIError
+from app.adapters.leetcode import LeetCodeAdapter, LeetCodeAPIError
 from app.config import settings
 from app.database import async_session_factory
 from app.models.contest_performance import ContestPerformance
 from app.models.platform_link import PlatformLink
 from app.models.problem import Problem
 from app.models.submission import Submission
+from app.utils.crypto import decrypt_token
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +38,26 @@ class SyncAlreadyRunningError(Exception):
     pass
 
 
+def _derive_leetcode_contest_id(title: str, start_time: int) -> int:
+    """Derives a deterministic 32-bit positive integer contest ID for LeetCode contests."""
+    match = re.search(r'(weekly|biweekly)\s+contest\s+(\d+)', title, re.IGNORECASE)
+    if match:
+        c_type, c_num = match.group(1).lower(), int(match.group(2))
+        prefix = 100000 if c_type == 'weekly' else 200000
+        return prefix + c_num
+    if start_time and start_time > 0:
+        return start_time % 2000000000
+    return abs(hash(title)) % 2000000000
+
+
 class CodeforcesSyncService:
-    def __init__(self, adapter: Optional[CodeforcesAdapter] = None):
+    def __init__(
+        self,
+        adapter: Optional[CodeforcesAdapter] = None,
+        leetcode_adapter: Optional[LeetCodeAdapter] = None,
+    ):
         self.adapter = adapter or CodeforcesAdapter()
+        self.leetcode_adapter = leetcode_adapter or LeetCodeAdapter()
 
     async def acquire_lease(self, link_id: int, worker_id: str) -> bool:
         """
@@ -124,25 +144,32 @@ class CodeforcesSyncService:
                 raise ValueError(f"PlatformLink {link_id} not found")
             user_id = link.user_id
             handle = link.handle
+            platform = link.platform
+            auth_token = link.auth_token
 
         try:
-            # 1. Fetch user contest history from API (OUTSIDE DB transaction)
-            raw_contests = await self.adapter.get_user_rating(handle)
+            if platform == "leetcode":
+                synced_subs, synced_contests, upserted_problems = await self._sync_leetcode(
+                    user_id=user_id,
+                    handle=handle,
+                    auth_token=auth_token,
+                )
+            elif platform == "codeforces":
+                synced_subs, synced_contests, upserted_problems = await self._sync_codeforces(
+                    user_id=user_id,
+                    handle=handle,
+                    force_full=force_full,
+                    max_pages=max_pages,
+                )
+            else:
+                raise ValueError(f"Unsupported platform '{platform}' for link {link_id}")
 
-            # 2. Synchronize submissions via stop-on-overlap pagination (OUTSIDE DB transaction per page)
-            synced_subs, upserted_problems = await self._sync_submissions(
-                user_id, handle, max_pages=max_pages, check_overlap=not force_full
-            )
-
-            # 3. Persist contest performances (idempotent upsert)
-            synced_contests = await self._persist_contests(user_id, raw_contests)
-
-            # 4. Release lease on success
+            # Release lease on success
             released = await self.release_lease(link_id, worker_id, status="synced")
             if not released:
                 logger.warning(f"Lease fence expired or stolen for worker {worker_id} on link {link_id}")
 
-            # 5. Post-sync analytics rebuild hook
+            # Post-sync analytics rebuild hook
             try:
                 from app.services.analytics import AnalyticsService
                 analytics_service = AnalyticsService()
@@ -161,6 +188,28 @@ class CodeforcesSyncService:
             await self.release_lease(link_id, worker_id, status="failed", error=str(exc))
             raise
 
+    # ── Codeforces Sync Flow ──────────────────────────────────────────────
+
+    async def _sync_codeforces(
+        self,
+        user_id: int,
+        handle: str,
+        force_full: bool = False,
+        max_pages: Optional[int] = None,
+    ) -> Tuple[int, int, int]:
+        # 1. Fetch user contest history from API (OUTSIDE DB transaction)
+        raw_contests = await self.adapter.get_user_rating(handle)
+
+        # 2. Synchronize submissions via stop-on-overlap pagination (OUTSIDE DB transaction per page)
+        synced_subs, upserted_problems = await self._sync_submissions(
+            user_id, handle, max_pages=max_pages, check_overlap=not force_full
+        )
+
+        # 3. Persist contest performances (idempotent upsert)
+        synced_contests = await self._persist_contests(user_id, raw_contests)
+
+        return synced_subs, synced_contests, upserted_problems
+
     async def _sync_submissions(
         self,
         user_id: int,
@@ -168,23 +217,6 @@ class CodeforcesSyncService:
         max_pages: Optional[int] = None,
         check_overlap: bool = True,
     ) -> Tuple[int, int]:
-        """
-        Paginates submissions newest-first.
-
-        On first sync (no existing submissions in DB):
-          - Continues fetching until an empty or short (< page_size) page is returned.
-          - No arbitrary 10-page limit.
-
-        On subsequent syncs:
-          - Stop-on-overlap optimization: terminates as soon as any submission on the
-            page already exists in the database (len(existing_ids) > 0), after safely
-            persisting any new submissions that appeared on that boundary page.
-
-        Infinite-loop protection:
-          - Detects API cycles (if all IDs on a page have already been seen in this sync run).
-          - Checks for empty or short pages.
-          - Supports optional max_pages parameter if an explicit upper bound is passed.
-        """
         page_size = settings.sync_page_size
         from_index = 1
         total_synced_subs = 0
@@ -212,7 +244,7 @@ class CodeforcesSyncService:
             if not sub_ids:
                 break
 
-            # Infinite loop / cycle protection: ensure the API is returning fresh IDs
+            # Infinite loop / cycle protection
             if all(sid in seen_sync_sub_ids for sid in sub_ids):
                 logger.warning(
                     f"API cycle detected for handle '{handle}': all submission IDs on page {page_count} "
@@ -221,7 +253,7 @@ class CodeforcesSyncService:
                 break
             seen_sync_sub_ids.update(sub_ids)
 
-            # Check for existing IDs in the database to detect overlap with prior syncs
+            # Check for existing IDs in the database
             async with async_session_factory() as session:
                 existing_res = await session.execute(
                     select(Submission.platform_sub_id).where(
@@ -232,22 +264,15 @@ class CodeforcesSyncService:
                 )
                 existing_ids: Set[int] = set(existing_res.scalars().all())
 
-            # Filter out already existing submissions (handles boundary page with mix of new and existing)
             new_submissions = [sub for sub in submissions_page if sub["id"] not in existing_ids]
 
             if new_submissions:
-                # Step A: Upsert problems for these new submissions first (FK dependency)
                 prob_count = await self._upsert_problems_from_submissions(new_submissions)
                 total_upserted_problems += prob_count
 
-                # Step B: Insert the new submissions idempotently
                 inserted_count = await self._persist_submissions(user_id, new_submissions)
                 total_synced_subs += inserted_count
 
-            # Termination conditions:
-            # 1. Overlap reached: if check_overlap is True and at least one submission on this page
-            #    already existed in the DB, we have caught up with previously synced history.
-            # 2. Final short page: if the page has fewer items than page_size, we reached the end of history.
             if (check_overlap and len(existing_ids) > 0) or len(submissions_page) < page_size:
                 break
 
@@ -256,7 +281,6 @@ class CodeforcesSyncService:
         return total_synced_subs, total_upserted_problems
 
     async def _upsert_problems_from_submissions(self, raw_submissions: List[Dict]) -> int:
-        """Extracts embedded problems and upserts them into problems table."""
         problems_map: Dict[str, Dict] = {}
         for sub in raw_submissions:
             prob = sub.get("problem")
@@ -286,7 +310,6 @@ class CodeforcesSyncService:
         values = list(problems_map.values())
         async with async_session_factory() as session:
             stmt = insert(Problem).values(values)
-            # On conflict update title, rating, tags, and url in case problem details updated
             stmt = stmt.on_conflict_do_update(
                 index_elements=["platform", "platform_id"],
                 set_={
@@ -302,8 +325,6 @@ class CodeforcesSyncService:
         return len(values)
 
     async def _persist_submissions(self, user_id: int, raw_submissions: List[Dict]) -> int:
-        """Inserts submissions with resolved problem_id foreign keys, using ON CONFLICT DO NOTHING."""
-        # Query problem primary key IDs for the platform_ids
         platform_ids = [
             f"{sub['problem']['contestId']}_{sub['problem']['index']}"
             for sub in raw_submissions
@@ -363,7 +384,6 @@ class CodeforcesSyncService:
             return res.rowcount if res.rowcount is not None else len(sub_records)
 
     async def _persist_contests(self, user_id: int, raw_contests: List[Dict]) -> int:
-        """Idempotently saves user rating changes from Codeforces."""
         if not raw_contests:
             return 0
 
@@ -397,3 +417,256 @@ class CodeforcesSyncService:
             res = await session.execute(stmt)
             await session.commit()
             return res.rowcount if res.rowcount is not None else len(records)
+
+    # ── LeetCode Sync Flow ────────────────────────────────────────────────
+
+    async def _sync_leetcode(
+        self,
+        user_id: int,
+        handle: str,
+        auth_token: Optional[str] = None,
+    ) -> Tuple[int, int, int]:
+        raw_token = decrypt_token(auth_token) if auth_token else None
+
+        # Auto-detect canonical username if session cookie is present
+        if raw_token:
+            auth_user = await self.leetcode_adapter.get_authenticated_user(raw_token)
+            if auth_user and auth_user.get("username") and auth_user["username"] != handle:
+                canonical = auth_user["username"]
+                logger.info(
+                    f"Auto-correcting LeetCode handle for user {user_id}: '{handle}' -> '{canonical}'"
+                )
+                handle = canonical
+                async with async_session_factory() as session:
+                    await session.execute(
+                        text("UPDATE platform_links SET handle = :h WHERE user_id = :uid AND platform = 'leetcode'"),
+                        {"h": canonical, "uid": user_id},
+                    )
+                    await session.commit()
+        else:
+            # Validate public user exists so typos/display names fail fast with clear message
+            await self.leetcode_adapter.get_user_profile(handle)
+
+        # 1. Contest performances (publicly accessible)
+        contest_data = await self.leetcode_adapter.get_user_contest_ranking(
+            handle, auth_token=raw_token
+        )
+        history = contest_data.get("history") or []
+        synced_contests = await self._persist_leetcode_contests(user_id, history)
+
+        # 2. Submissions & Problems (only with auth_token cookie)
+        synced_subs = 0
+        upserted_problems = 0
+        if raw_token:
+            synced_subs, upserted_problems = await self._sync_leetcode_submissions(
+                user_id=user_id,
+                handle=handle,
+                raw_token=raw_token,
+            )
+
+        return synced_subs, synced_contests, upserted_problems
+
+    async def _persist_leetcode_contests(
+        self, user_id: int, raw_history: List[Dict]
+    ) -> int:
+        if not raw_history:
+            return 0
+
+        attended = [c for c in raw_history if c.get("attended")]
+        if not attended:
+            return 0
+
+        # Sort chronologically by start time
+        attended.sort(key=lambda c: c.get("contest", {}).get("startTime", 0))
+
+        records = []
+        prev_rating = 1500  # Standard initial rating on LeetCode
+        for c in attended:
+            contest_info = c.get("contest") or {}
+            title = contest_info.get("title", "LeetCode Contest")
+            start_time = contest_info.get("startTime", 0)
+            contest_id = _derive_leetcode_contest_id(title, start_time)
+
+            raw_rating = c.get("rating")
+            curr_rating = round(float(raw_rating)) if raw_rating is not None else prev_rating
+            update_time = datetime.fromtimestamp(start_time, tz=timezone.utc)
+
+            records.append({
+                "user_id": user_id,
+                "platform": "leetcode",
+                "contest_id": contest_id,
+                "contest_name": title,
+                "rating_before": prev_rating,
+                "rating_after": curr_rating,
+                "rank": int(c.get("ranking", 0)),
+                "contest_date": update_time,
+            })
+            prev_rating = curr_rating
+
+        if not records:
+            return 0
+
+        async with async_session_factory() as session:
+            stmt = insert(ContestPerformance).values(records)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["user_id", "platform", "contest_id"]
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            return res.rowcount if res.rowcount is not None else len(records)
+
+    async def _sync_leetcode_submissions(
+        self, user_id: int, handle: str, raw_token: str
+    ) -> Tuple[int, int]:
+        recent_subs = await self.leetcode_adapter.get_recent_submissions(
+            handle, limit=100, auth_token=raw_token
+        )
+        if not recent_subs:
+            return 0, 0
+
+        sub_ids = []
+        for s in recent_subs:
+            try:
+                sub_ids.append(int(s["id"]))
+            except (ValueError, TypeError):
+                continue
+
+        if not sub_ids:
+            return 0, 0
+
+        # Check existing submissions in DB
+        async with async_session_factory() as session:
+            existing_res = await session.execute(
+                select(Submission.platform_sub_id).where(
+                    Submission.user_id == user_id,
+                    Submission.platform == "leetcode",
+                    Submission.platform_sub_id.in_(sub_ids),
+                )
+            )
+            existing_ids: Set[int] = set(existing_res.scalars().all())
+
+        new_subs = [s for s in recent_subs if int(s["id"]) not in existing_ids]
+        if not new_subs:
+            return 0, 0
+
+        # Step A: Upsert problems for new submissions
+        total_upserted_problems = await self._upsert_leetcode_problems(new_subs)
+
+        # Step B: Insert submissions
+        total_synced_subs = await self._persist_leetcode_submissions(user_id, new_subs)
+
+        return total_synced_subs, total_upserted_problems
+
+    async def _upsert_leetcode_problems(self, raw_submissions: List[Dict]) -> int:
+        slugs = list({s["titleSlug"] for s in raw_submissions if s.get("titleSlug")})
+        if not slugs:
+            return 0
+
+        async with async_session_factory() as session:
+            existing_res = await session.execute(
+                select(Problem.platform_id).where(
+                    Problem.platform == "leetcode",
+                    Problem.platform_id.in_(slugs),
+                )
+            )
+            existing_slugs = set(existing_res.scalars().all())
+
+        needed_slugs = [slug for slug in slugs if slug not in existing_slugs]
+        problems_to_insert = []
+
+        for slug in needed_slugs:
+            q_data = None
+            try:
+                q_data = await self.leetcode_adapter.get_problem_by_slug(slug)
+            except Exception as e:
+                logger.warning(f"Could not fetch problem details for slug '{slug}': {e}")
+
+            sub_item = next((s for s in raw_submissions if s.get("titleSlug") == slug), {})
+            title = (q_data.get("title") if q_data else None) or sub_item.get("title") or slug.replace("-", " ").title()
+            difficulty = q_data.get("difficulty") if q_data else None
+            tags = [t.get("name") for t in q_data.get("topicTags", [])] if q_data and q_data.get("topicTags") else []
+
+            problems_to_insert.append({
+                "platform": "leetcode",
+                "platform_id": slug,
+                "title": title,
+                "rating": None,  # Decision 1: rating is None for LC
+                "difficulty_label": difficulty,  # Easy / Medium / Hard
+                "tags": tags,
+                "url": f"https://leetcode.com/problems/{slug}/",
+                "solved_count": 0,
+            })
+
+        if not problems_to_insert:
+            return 0
+
+        async with async_session_factory() as session:
+            stmt = insert(Problem).values(problems_to_insert)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["platform", "platform_id"],
+                set_={
+                    "title": stmt.excluded.title,
+                    "difficulty_label": stmt.excluded.difficulty_label,
+                    "tags": stmt.excluded.tags,
+                    "url": stmt.excluded.url,
+                }
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+        return len(problems_to_insert)
+
+    async def _persist_leetcode_submissions(
+        self, user_id: int, raw_submissions: List[Dict]
+    ) -> int:
+        slugs = [s.get("titleSlug") for s in raw_submissions if s.get("titleSlug")]
+        if not slugs:
+            return 0
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(Problem.platform_id, Problem.id).where(
+                    Problem.platform == "leetcode",
+                    Problem.platform_id.in_(slugs),
+                )
+            )
+            prob_id_map = dict(result.all())
+
+        sub_records = []
+        for sub in raw_submissions:
+            slug = sub.get("titleSlug")
+            db_prob_id = prob_id_map.get(slug)
+            if not db_prob_id:
+                continue
+
+            created_time = datetime.fromtimestamp(
+                sub.get("timestamp", 0), tz=timezone.utc
+            )
+
+            sub_records.append({
+                "user_id": user_id,
+                "problem_id": db_prob_id,
+                "platform": "leetcode",
+                "platform_sub_id": int(sub["id"]),
+                "verdict": sub.get("verdict", "UNKNOWN"),
+                "language": sub.get("lang"),
+                "submitted_at": created_time,
+                "time_ms": None,
+                "memory_bytes": None,
+            })
+
+        if not sub_records:
+            return 0
+
+        async with async_session_factory() as session:
+            stmt = insert(Submission).values(sub_records)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["user_id", "platform", "platform_sub_id"]
+            )
+            res = await session.execute(stmt)
+            await session.commit()
+            return res.rowcount if res.rowcount is not None else len(sub_records)
+
+
+# Alias PlatformSyncService to CodeforcesSyncService for unified naming
+PlatformSyncService = CodeforcesSyncService

@@ -130,10 +130,32 @@ class LLMClient:
             },
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+        import asyncio
+        data = None
+        last_err = None
+        for attempt in range(5):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    resp = await client.post(url, json=payload)
+                    if resp.status_code in (503, 429) and attempt < 4:
+                        wait = 2.0 * (attempt + 1)
+                        logger.warning(f"Gemini {resp.status_code} on attempt {attempt+1}, retrying in {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+            except httpx.TimeoutException as exc:
+                last_err = exc
+                if attempt < 4:
+                    wait = 3.0 * (attempt + 1)
+                    logger.warning(f"Gemini ReadTimeout on attempt {attempt+1}, retrying in {wait}s")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+        if data is None:
+            raise RuntimeError("Gemini API call failed after retries")
 
         candidates = data.get("candidates", [])
         if not candidates:

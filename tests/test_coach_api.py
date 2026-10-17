@@ -4,6 +4,7 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.config import settings
 from app.database import async_session_factory, engine
 from app.main import app
 from app.models.problem import Problem
@@ -37,7 +38,8 @@ async def test_knowledge_and_coach_api_flow():
         user_id = user.id
         prob_id = prob.id
 
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    headers = {"X-API-Key": settings.api_key}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         # 2. Extract knowledge via POST /api/knowledge/extract
         editorial_text = """
         <h3>Problem C. Two Arrays and Sums</h3>

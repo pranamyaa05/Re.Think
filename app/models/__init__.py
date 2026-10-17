@@ -13,6 +13,8 @@ from app.models.problem_knowledge import ProblemKnowledge
 from app.models.hint_session import HintSession
 from app.models.hint_message import HintMessage
 from app.models.llm_call_log import LLMCallLog
+from app.models.recommendation import Recommendation
+from app.models.reflection import Reflection
 
 __all__ = [
     "User",
@@ -25,4 +27,6 @@ __all__ = [
     "HintSession",
     "HintMessage",
     "LLMCallLog",
+    "Recommendation",
+    "Reflection",
 ]

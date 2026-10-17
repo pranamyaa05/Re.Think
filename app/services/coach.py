@@ -6,15 +6,20 @@ FSM Transition Routing, Non-Patronizing Tone Enforcement, and Two-Tier Guardrail
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from fastapi import HTTPException, status
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.database import async_session_factory
 from app.models.hint_message import HintMessage
 from app.models.hint_session import HintSession
+from app.models.llm_call_log import LLMCallLog
 from app.models.problem import Problem
 from app.models.problem_knowledge import ProblemKnowledge
 from app.models.user import User
@@ -22,6 +27,68 @@ from app.services.editorial import resolve_coach_mode
 from app.services.llm import LLMClient
 
 logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# Rate Limiting & Daily LLM Call Guards
+# ==============================================================================
+
+_user_last_coach_message: Dict[int, float] = {}
+
+
+def check_coach_rate_limit(user_id: int) -> None:
+    """
+    Enforces a minimum interval (settings.coach_rate_limit_seconds, default 3.0s)
+    between coach messages for a given user.
+    Raises HTTPException(429) if triggered.
+    """
+    now = time.time()
+    last_time = _user_last_coach_message.get(user_id, 0.0)
+    elapsed = now - last_time
+    if elapsed < settings.coach_rate_limit_seconds:
+        retry_after = round(settings.coach_rate_limit_seconds - elapsed, 1)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded: please wait {retry_after}s before sending another message.",
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+    _user_last_coach_message[user_id] = now
+
+
+def reset_rate_limits() -> None:
+    """Helper to clear rate limit state during tests."""
+    _user_last_coach_message.clear()
+
+
+async def check_daily_llm_cap(session: AsyncSession, user_id: int) -> int:
+    """
+    Checks the user's total LLM call count for the current UTC day against settings.daily_llm_call_cap.
+    Raises HTTPException(429) if exceeded.
+    Returns the current count.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today_start = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+
+    stmt = (
+        select(func.count(LLMCallLog.id))
+        .select_from(LLMCallLog)
+        .join(HintSession, LLMCallLog.session_id == HintSession.id)
+        .where(
+            HintSession.user_id == user_id,
+            LLMCallLog.created_at >= today_start,
+        )
+    )
+    result = await session.execute(stmt)
+    count = result.scalar() or 0
+
+    if count >= settings.daily_llm_call_cap:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Daily LLM call cap of {settings.daily_llm_call_cap} calls exceeded "
+                f"for user {user_id} (current count: {count}). Please try again tomorrow (UTC)."
+            ),
+        )
+    return count
 
 # ==============================================================================
 # Tier 1 Deterministic Hard Gate Patterns
@@ -190,7 +257,7 @@ Hint Levels:
 Level 0: Clarification / Diagnostic (problem constraints, invariants, edge cases)
 Level 1: Socratic Nudge (identifying structural property or invariant without naming algorithms)
 Level 2: Algorithmic Direction (algorithmic paradigm, sub-problem reduction)
-Level 3: Concrete Strategy (state definition, transitions, proofs)
+Level 3: Specific Technique Identification (naming specific technique/data structure family without full derivation)
 Level 4: Mathematical Pseudocode (formal mathematical steps)
 
 Rules:
@@ -221,16 +288,6 @@ async def evaluate_fsm_transition(
     request_escalation: bool = False,
     session_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Evaluates student message and code state to determine FSM transition."""
-    if request_escalation:
-        next_lvl = max(2, min(4, current_level + 1))
-        return {
-            "understood_current_level": True,
-            "extracted_approach": user_stated_approach or "User requested escalation",
-            "recommended_next_level": next_lvl,
-            "reasoning": "User explicitly requested algorithmic escalation.",
-        }
-
     history_str = ""
     if previous_messages:
         turns = [f"{m['role'].upper()}: {m['content']}" for m in previous_messages[-4:]]
@@ -238,6 +295,7 @@ async def evaluate_fsm_transition(
 
     code_str = f"\nUser Code Snapshot:\n```\n{current_code}\n```" if current_code else "\nNo code provided yet."
     approach_str = f"\nPreviously stated approach: {user_stated_approach}" if user_stated_approach else ""
+    escalation_str = "\nUser flag: The student explicitly requested algorithmic escalation (Rule 5 applies: jump to at least Level 2)." if request_escalation else ""
 
     user_prompt = (
         f"Problem: {problem_title}\n"
@@ -245,8 +303,9 @@ async def evaluate_fsm_transition(
         f"{approach_str}"
         f"{history_str}\n"
         f"User Latest Message: {user_message}"
-        f"{code_str}\n\n"
-        "Evaluate student understanding and determine whether to advance or hold."
+        f"{code_str}"
+        f"{escalation_str}\n\n"
+        "Evaluate student understanding, extract their approach, and determine whether to advance, hold, or escalate."
     )
 
     try:
@@ -259,18 +318,23 @@ async def evaluate_fsm_transition(
             session_id=session_id,
         )
         data = resp.json()
+        rec_lvl = int(data.get("recommended_next_level", current_level))
+        if request_escalation:
+            rec_lvl = max(2, min(4, max(rec_lvl, current_level + 1)))
+
         return {
             "understood_current_level": bool(data.get("understood_current_level", True)),
             "extracted_approach": str(data.get("extracted_approach", user_stated_approach or "")),
-            "recommended_next_level": int(data.get("recommended_next_level", current_level)),
+            "recommended_next_level": rec_lvl,
             "reasoning": str(data.get("reasoning", "")),
         }
     except Exception as e:
         logger.warning(f"FSM Evaluator failed: {e}")
+        fallback_lvl = max(2, current_level + 1) if request_escalation else min(4, current_level + 1)
         return {
             "understood_current_level": True,
             "extracted_approach": user_stated_approach or "",
-            "recommended_next_level": min(4, current_level + 1),
+            "recommended_next_level": fallback_lvl,
             "reasoning": f"Default fallback due to evaluator failure: {e}",
         }
 
@@ -299,6 +363,7 @@ GUARDRAILS:
 - Do NOT provide full code solutions.
 - At Level 0-3: Never use triple-backtick code fences.
 - At Level 0-1: Never name specific algorithms or data structures.
+- At Level 3: You may name ONE specific technique or data structure family, but do NOT provide: state definitions, invariants, transition formulas, recurrence relations, proofs of correctness, or complexity derivations.
 - At Level 4: Mathematical pseudocode only. Never write syntax in C++, Python, or Java.
 """
 
@@ -334,9 +399,10 @@ LEVEL_INSTRUCTIONS = {
         "bipartite graph modeling, binary search on answer, greedy sorting). Explain how the sub-problem decomposes."
     ),
     3: (
-        "Level 3 (Concrete Strategy):\n"
-        "Specify the exact state definition, transition relation, or data structure invariants. "
-        "Detail how the optimal substructure or update mechanism works mathematically."
+        "Level 3 (Specific Technique Identification):\n"
+        "At this level you may name ONE specific technique or data structure family (e.g. 'binary search', 'segment tree', 'divide and conquer'). "
+        "You must NOT provide: state definitions, invariants, transition formulas, recurrence relations, proofs of correctness, or complexity derivations. "
+        "If the user asks for the full derivation, tell them to request Level 4 explicitly, and do not provide it unless they do."
     ),
     4: (
         "Level 4 (Mathematical Pseudocode):\n"
@@ -359,6 +425,7 @@ async def generate_hint(
     fsm_evaluation: Optional[Dict[str, Any]] = None,
     is_hold: bool = False,
     session_id: Optional[int] = None,
+    rejection_reason: Optional[str] = None,
 ) -> Tuple[str, bool]:
     """
     Generates hint via LLM, applies Tier 1 hard gate, regenerates if blocked,
@@ -417,12 +484,18 @@ async def generate_hint(
         f"Provide your Level {target_level} coaching response following all constraints."
     )
 
+    if rejection_reason:
+        system_prompt += f"\n\nCRITICAL CONSTRAINT:\n{rejection_reason}"
+        user_prompt += f"\n\nCRITICAL CONSTRAINT:\n{rejection_reason}"
+
+    caller_name = "hint_generator_remediation" if rejection_reason else "hint_generator"
+
     # 1. Primary generation
     resp = await llm_client.generate(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
-        temperature=0.2,
-        caller="hint_generator",
+        temperature=0.2 if not rejection_reason else 0.0,
+        caller=caller_name,
         session_id=session_id,
     )
     hint_text = resp.content.strip()
@@ -462,11 +535,157 @@ async def generate_hint(
             elif target_level == 2:
                 hint_text = "Think about modeling this as a decision problem. What standard algorithmic paradigm decomposes these sub-problems?"
             elif target_level == 3:
-                hint_text = "Define the mathematical state function S(i) representing the optimal value considering the first i elements. What is the recurrence?"
+                hint_text = "You're very close — try formalizing the specific data structure or technique name only, without deriving the full algorithm yet."
             else:
                 hint_text = "Step 1: Compute prefix invariants. Step 2: For each query, evaluate boundary conditions mathematically."
 
     return hint_text, tier1_blocked
+
+
+async def log_rejection_event(
+    session_id: Optional[int],
+    attempt: int,
+    original_hint: str,
+    regenerated_hint: str,
+    model: str = "tier2_judge",
+) -> None:
+    """Logs rejection details to llm_call_log for complete traceability."""
+    try:
+        async with async_session_factory() as session:
+            entry = LLMCallLog(
+                session_id=session_id,
+                caller=f"tier2_full_solution_rejection_att_{attempt}",
+                model=model,
+                tokens_in=0,
+                tokens_out=0,
+                latency_ms=0,
+                rejection_details=(
+                    f"Attempt {attempt}: reveals_full_solution=True.\n"
+                    f"Original Hint: {original_hint}\n"
+                    f"Regenerated Hint: {regenerated_hint}"
+                ),
+            )
+            session.add(entry)
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"Failed to log rejection event: {e}")
+
+
+async def generate_and_audit_hint(
+    llm_client: LLMClient,
+    target_level: int,
+    coach_mode: str,
+    problem: Problem,
+    knowledge: Optional[ProblemKnowledge],
+    dialog_history: List[Dict[str, str]],
+    user_message: str,
+    current_code: Optional[str] = None,
+    fsm_evaluation: Optional[Dict[str, Any]] = None,
+    is_hold: bool = False,
+    session_id: Optional[int] = None,
+) -> Tuple[str, bool, Dict[str, bool]]:
+    """
+    Generates hint via generate_hint (with Tier 1 deterministic gate),
+    then audits via Tier 2 judge.
+    Enforces a HARD GATE specifically on reveals_full_solution == True:
+    rejects and regenerates up to 2 times with a stricter prompt.
+    Falls back to a safe level-specific response if both attempts still leak.
+    Leaves the other 4 checklist items in shadow mode.
+    Logs every rejection to llm_call_log.
+    """
+    hint_text, tier1_blocked = await generate_hint(
+        llm_client=llm_client,
+        target_level=target_level,
+        coach_mode=coach_mode,
+        problem=problem,
+        knowledge=knowledge,
+        dialog_history=dialog_history,
+        user_message=user_message,
+        current_code=current_code,
+        fsm_evaluation=fsm_evaluation,
+        is_hold=is_hold,
+        session_id=session_id,
+    )
+
+    leakage_checklist = await evaluate_tier2_judge(
+        llm_client=llm_client,
+        hint_content=hint_text,
+        problem_title=problem.title,
+        level=target_level,
+        session_id=session_id,
+    )
+
+    if leakage_checklist.get("reveals_full_solution", False):
+        logger.warning(
+            f"Tier 2 hard gate: Hint at level {target_level} revealed full solution. Rejecting and regenerating."
+        )
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            rejection_reason = (
+                f"Your previous response revealed the full solution. "
+                f"Regenerate a hint appropriate for Level {target_level} that explains "
+                f"WHAT to think about, not the complete derivation, invariant proof, or termination argument."
+            )
+            regen_hint, regen_tier1_blocked = await generate_hint(
+                llm_client=llm_client,
+                target_level=target_level,
+                coach_mode=coach_mode,
+                problem=problem,
+                knowledge=knowledge,
+                dialog_history=dialog_history,
+                user_message=user_message,
+                current_code=current_code,
+                fsm_evaluation=fsm_evaluation,
+                is_hold=is_hold,
+                session_id=session_id,
+                rejection_reason=rejection_reason,
+            )
+            if regen_tier1_blocked:
+                tier1_blocked = True
+
+            regen_checklist = await evaluate_tier2_judge(
+                llm_client=llm_client,
+                hint_content=regen_hint,
+                problem_title=problem.title,
+                level=target_level,
+                session_id=session_id,
+            )
+
+            await log_rejection_event(
+                session_id=session_id,
+                attempt=attempt,
+                original_hint=hint_text,
+                regenerated_hint=regen_hint,
+                model="tier2_judge",
+            )
+
+            hint_text = regen_hint
+            leakage_checklist = regen_checklist
+
+            if not leakage_checklist.get("reveals_full_solution", False):
+                logger.info(
+                    f"Tier 2 regeneration attempt {attempt} succeeded: reveals_full_solution=False."
+                )
+                break
+        else:
+            logger.warning(
+                f"Tier 2 hard gate: Both regeneration attempts failed for level {target_level}. "
+                f"Falling back to safe response."
+            )
+            fallback_responses = {
+                0: "What is the maximum bound on the input variables, and what operation limits does the problem specify?",
+                1: "Consider what invariant or structural property holds across the elements. Think about how the answer behaves under small perturbations without naming an algorithm yet.",
+                2: "Consider which general algorithmic paradigm fits this problem's constraints (e.g. divide-and-conquer, greedy, dynamic programming). How can you decompose the problem into independent subproblems?",
+                3: "You're very close — try formalizing the specific data structure or technique name only, without deriving the full algorithm yet.",
+                4: "Formalize the mathematical steps of your approach step-by-step using mathematical definitions and state transitions, avoiding full program syntax.",
+            }
+            hint_text = fallback_responses.get(
+                target_level,
+                "You're very close — try formalizing the specific data structure or technique name only, without deriving the full algorithm yet.",
+            )
+            leakage_checklist["reveals_full_solution"] = False
+
+    return hint_text, tier1_blocked, leakage_checklist
 
 
 # ==============================================================================
@@ -503,6 +722,9 @@ class CoachService:
             if not user:
                 raise ValueError(f"User id={user_id} not found.")
 
+            # Enforce daily LLM call cap before generating initial Level 0 hint
+            await check_daily_llm_cap(session, user_id)
+
             # Fetch knowledge
             know_res = await session.execute(
                 select(ProblemKnowledge).where(ProblemKnowledge.problem_id == problem_id)
@@ -523,8 +745,8 @@ class CoachService:
             await session.commit()  # Commit so hint_session exists in DB for FK in llm_call_log
             session_id = hint_session.id
 
-            # Generate initial Level 0 hint
-            hint_text, tier1_blocked = await generate_hint(
+            # Generate initial Level 0 hint with Tier 1 and Tier 2 audit
+            hint_text, tier1_blocked, leakage_checklist = await generate_and_audit_hint(
                 llm_client=self.llm_client,
                 target_level=0,
                 coach_mode=coach_mode,
@@ -532,15 +754,6 @@ class CoachService:
                 knowledge=knowledge,
                 dialog_history=[],
                 user_message="I'm starting to look at this problem. Where should I begin?",
-                session_id=session_id,
-            )
-
-            # Tier 2 shadow judge evaluation
-            leakage_checklist = await evaluate_tier2_judge(
-                llm_client=self.llm_client,
-                hint_content=hint_text,
-                problem_title=problem.title,
-                level=0,
                 session_id=session_id,
             )
 
@@ -593,6 +806,14 @@ class CoachService:
             if hint_session.outcome != "ongoing":
                 raise ValueError(f"HintSession id={session_id} is concluded ({hint_session.outcome}).")
 
+            user_id = hint_session.user_id
+
+            # Enforce message rate limit (max 1 request per 3 seconds per user)
+            check_coach_rate_limit(user_id)
+
+            # Enforce daily LLM call cap before generating hint or evaluating FSM
+            await check_daily_llm_cap(session, user_id)
+
             problem = hint_session.problem
 
             # Fetch knowledge
@@ -640,9 +861,9 @@ class CoachService:
             hint_session.current_level = target_level
             hint_session.last_activity_at = datetime.now(timezone.utc)
 
-            # 2. Hint Generator step
+            # 2. Hint Generator & Tier 2 Audit step
             is_hold = not understood
-            hint_text, tier1_blocked = await generate_hint(
+            hint_text, tier1_blocked, leakage_checklist = await generate_and_audit_hint(
                 llm_client=self.llm_client,
                 target_level=target_level,
                 coach_mode=hint_session.coach_mode,
@@ -653,15 +874,6 @@ class CoachService:
                 current_code=current_code,
                 fsm_evaluation=fsm_eval,
                 is_hold=is_hold,
-                session_id=session_id,
-            )
-
-            # 3. Tier 2 shadow judge evaluation
-            leakage_checklist = await evaluate_tier2_judge(
-                llm_client=self.llm_client,
-                hint_content=hint_text,
-                problem_title=problem.title,
-                level=target_level,
                 session_id=session_id,
             )
 

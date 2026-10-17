@@ -12,6 +12,13 @@ venv/
 
 # Environment / secrets
 .env
+*.env
+!.env.example
+.env.*
+
+# Scratch and verification scripts
+scratch/
+scripts/
 
 # IDE
 .vscode/

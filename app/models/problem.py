@@ -27,14 +27,15 @@ class Problem(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     platform: Mapped[str] = mapped_column(String(20), nullable=False)
 
-    # Synthetic unique ID: "{contestId}_{index}" for CF
-    platform_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Synthetic unique ID: "{contestId}_{index}" for CF, titleSlug for LeetCode
+    platform_id: Mapped[str] = mapped_column(String(255), nullable=False)
 
     # CF-specific fields (from the API's Problem object)
     contest_id: Mapped[Optional[int]] = mapped_column(Integer, default=None)
     problem_index: Mapped[Optional[str]] = mapped_column(String(10), default=None)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     rating: Mapped[Optional[int]] = mapped_column(Integer, default=None)
+    difficulty_label: Mapped[Optional[str]] = mapped_column(String(20), default=None)
     tags: Mapped[Optional[list[str]]] = mapped_column(
         ARRAY(String), server_default="{}", default=list
     )
@@ -50,6 +51,9 @@ class Problem(Base):
     )
     hint_sessions: Mapped[list["HintSession"]] = relationship(
         back_populates="problem", cascade="all, delete-orphan"
+    )
+    recommendations: Mapped[list["Recommendation"]] = relationship(
+        back_populates="problem"
     )
 
     def __repr__(self) -> str:

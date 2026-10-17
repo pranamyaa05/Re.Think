@@ -4,6 +4,7 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 from app.main import app
+from app.config import settings
 from app.database import engine
 
 
@@ -18,13 +19,17 @@ async def test_health():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         res = await ac.get("/health")
     assert res.status_code == 200
-    assert res.json() == {"status": "ok", "service": "rethink-api"}
+    data = res.json()
+    assert data["status"] == "healthy"
+    assert data["database"] == "connected"
+    assert data["service"] == "rethink-api"
 
 
 @pytest.mark.asyncio
 async def test_create_and_get_user():
     username = f"cf_user_{uuid.uuid4().hex[:8]}"
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    headers = {"X-API-Key": settings.api_key}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         res = await ac.post("/api/users", json={"username": username})
         assert res.status_code == 201
         data = res.json()
@@ -39,7 +44,8 @@ async def test_create_and_get_user():
 @pytest.mark.asyncio
 async def test_platform_link_and_status():
     username = f"link_user_{uuid.uuid4().hex[:8]}"
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    headers = {"X-API-Key": settings.api_key}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         u_res = await ac.post("/api/users", json={"username": username})
         assert u_res.status_code == 201
         user_id = u_res.json()["id"]
@@ -60,7 +66,8 @@ async def test_platform_link_and_status():
 @pytest.mark.asyncio
 async def test_analytics_endpoints():
     username = f"analytics_user_{uuid.uuid4().hex[:8]}"
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    headers = {"X-API-Key": settings.api_key}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         u_res = await ac.post("/api/users", json={"username": username})
         assert u_res.status_code == 201
         user_id = u_res.json()["id"]
@@ -99,4 +106,3 @@ async def test_analytics_endpoints():
         # 6. Non-existent user returns 404
         bad_res = await ac.get("/api/analytics/999999/summary")
         assert bad_res.status_code == 404
-

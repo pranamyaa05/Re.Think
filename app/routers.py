@@ -42,11 +42,13 @@ from app.schemas import (
     UserResponse,
 )
 from app.services.analytics import AnalyticsService
+from app.dependencies.auth import verify_api_key
 from app.services.coach import CoachService
 from app.services.editorial import EditorialService, resolve_coach_mode
 from app.services.sync import CodeforcesSyncService, SyncAlreadyRunningError
+from app.utils.crypto import encrypt_token
 
-router = APIRouter(prefix="/api")
+router = APIRouter(prefix="/api", dependencies=[Depends(verify_api_key)])
 
 
 # ── Users ─────────────────────────────────────────────────────────────
@@ -87,10 +89,22 @@ async def link_platform(payload: PlatformLinkCreate, db: AsyncSession = Depends(
     if (await db.execute(existing_q)).scalar_one_or_none():
         raise HTTPException(status_code=400, detail=f"Platform '{payload.platform}' already linked for this user")
 
+    handle = payload.handle
+    if payload.platform == "leetcode" and payload.auth_token:
+        try:
+            from app.adapters.leetcode import LeetCodeAdapter
+            lc_adapter = LeetCodeAdapter()
+            auth_user = await lc_adapter.get_authenticated_user(payload.auth_token)
+            if auth_user and auth_user.get("username"):
+                handle = auth_user["username"]
+        except Exception:
+            pass
+
     link = PlatformLink(
         user_id=payload.user_id,
         platform=payload.platform,
-        handle=payload.handle,
+        handle=handle,
+        auth_token=encrypt_token(payload.auth_token) if payload.auth_token else None,
         sync_status="idle",
     )
     db.add(link)
@@ -466,4 +480,98 @@ async def conclude_coach_session(session_id: int, payload: SessionConcludeReques
         return session
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ── Phase 4: Recommendations ──────────────────────────────────────────────────
+
+from app.services.recommender import (
+    get_next_problem_recommendation,
+    list_active_recommendations,
+    dismiss_recommendation,
+)
+from app.schemas import (
+    RecommendationResponse,
+    RecommendationListItem,
+    DismissResponse,
+    ReflectionResponse,
+)
+
+
+@router.post("/recommendations/{user_id}/problem", response_model=RecommendationResponse)
+async def generate_problem_recommendation(user_id: int, db: AsyncSession = Depends(get_db)):
+    """Generate and persist a problem or study recommendation for the user."""
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    result = await get_next_problem_recommendation(user_id)
+    return result
+
+
+@router.get("/recommendations/{user_id}", response_model=List[RecommendationListItem])
+async def get_active_recommendations(user_id: int, db: AsyncSession = Depends(get_db)):
+    """List all active recommendations for the user."""
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return await list_active_recommendations(user_id)
+
+
+@router.post("/recommendations/{recommendation_id}/dismiss", response_model=DismissResponse)
+async def dismiss_rec(recommendation_id: int):
+    """Dismiss a recommendation by ID."""
+    result = await dismiss_recommendation(recommendation_id)
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return result
+
+
+# ── Phase 4: Reflections ──────────────────────────────────────────────────────
+
+from app.services.reflector import generate_daily_reflection, get_reflection
+from datetime import date as date_type
+
+
+@router.post("/reflections/{user_id}/generate", response_model=ReflectionResponse)
+async def generate_reflection(
+    user_id: int,
+    date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format, defaults to today"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate (or return existing) daily reflection for user_id on given date."""
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if date:
+        try:
+            target_date = date_type.fromisoformat(date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    else:
+        target_date = date_type.today()
+
+    result = await generate_daily_reflection(user_id=user_id, target_date=target_date)
+    return result
+
+
+@router.get("/reflections/{user_id}/{date}", response_model=ReflectionResponse)
+async def get_reflection_by_date(
+    user_id: int,
+    date: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retrieve an existing reflection for user_id on the given date."""
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        target_date = date_type.fromisoformat(date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    data = await get_reflection(user_id=user_id, target_date=target_date)
+    if data is None:
+        return {"status": "not_found", "reflection": None, "reason": f"No reflection for {date}"}
+    return {"status": "existing", "reflection": data}
 

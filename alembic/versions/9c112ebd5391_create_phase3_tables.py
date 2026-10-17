@@ -78,6 +78,7 @@ def upgrade() -> None:
     sa.Column('tokens_in', sa.Integer(), nullable=True),
     sa.Column('tokens_out', sa.Integer(), nullable=True),
     sa.Column('latency_ms', sa.Integer(), nullable=True),
+    sa.Column('rejection_details', sa.Text(), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
     sa.ForeignKeyConstraint(['session_id'], ['hint_sessions.id'], ondelete='SET NULL'),
     sa.PrimaryKeyConstraint('id')
