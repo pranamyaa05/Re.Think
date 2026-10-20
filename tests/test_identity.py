@@ -134,7 +134,10 @@ async def test_link_creation_queues_background_sync_and_returns_immediately():
     link_id = None
     try:
         fake_sync = AsyncMock()
-        with patch("app.routers.run_link_sync", new=fake_sync):
+        with patch(
+            "app.adapters.codeforces.CodeforcesAdapter.get_user_info",
+            new=AsyncMock(return_value={"handle": "tourist"}),
+        ), patch("app.routers.run_link_sync", new=fake_sync):
             async with AsyncClient(
                 transport=ASGITransport(app=app),
                 base_url="http://test",

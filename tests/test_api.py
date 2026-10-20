@@ -62,7 +62,11 @@ async def test_platform_link_and_status():
 
         # Link creation must queue the sync and return immediately; the worker
         # itself is stubbed so this contract test never calls a platform API.
-        with patch("app.routers.run_link_sync", new=AsyncMock()):
+        # Codeforces handle validation now calls the live API, so stub it.
+        with patch(
+            "app.adapters.codeforces.CodeforcesAdapter.get_user_info",
+            new=AsyncMock(return_value={"handle": "tourist"}),
+        ), patch("app.routers.run_link_sync", new=AsyncMock()):
             link_res = await ac.post(
                 "/api/platforms/link",
                 json={"user_id": user_id, "platform": "codeforces", "handle": "tourist"}

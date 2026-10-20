@@ -20,6 +20,10 @@ venv/
 scratch/
 scripts/
 
+# Local database backups (contain production-like data; never commit)
+backups/
+*.sql
+
 # IDE
 .vscode/
 .idea/

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from typing import List, Optional
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, computed_field, Field
 
 
 # ── Users ─────────────────────────────────────────────────────────────
@@ -46,6 +46,46 @@ class PlatformLinkResponse(BaseModel):
     sync_status: str
     sync_error: Optional[str] = None
     created_at: datetime
+    # Honest sync progress: fetched = what the platform API returned;
+    # inserted/upserted = what was new to this database.
+    submissions_fetched: int = 0
+    submissions_inserted: int = 0
+    contests_fetched: int = 0
+    contests_inserted: int = 0
+    problems_upserted: int = 0
+    # False for LeetCode links without a session cookie (contests + aggregate
+    # stats only; no per-submission data).
+    submissions_available: bool = True
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def message(self) -> Optional[str]:
+        """Human-readable message accompanying the status (e.g. why submissions
+        are unavailable). Never contains the encrypted session cookie."""
+        if self.platform == "leetcode" and not self.submissions_available:
+            return (
+                "Linked without a session cookie: contests and aggregate stats "
+                "only; add a LEETCODE_SESSION cookie for per-submission data."
+            )
+        return None
+
+
+class MeResponse(BaseModel):
+    """The resolved current user together with their platform links and sync
+    status — everything the UI needs to render the signed-in shell."""
+
+    # populate_by_name lets the model be built either from the ORM attribute
+    # ("platform_links") or directly by keyword ("links").
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: int
+    username: str
+    external_id: Optional[str] = None
+    created_at: datetime
+    # Populated from the User.platform_links relationship; serialized as "links".
+    links: List[PlatformLinkResponse] = Field(
+        default=[], validation_alias="platform_links", serialization_alias="links"
+    )
 
 
 class CoachSessionListItem(BaseModel):

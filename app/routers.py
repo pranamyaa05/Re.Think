@@ -49,6 +49,7 @@ from app.schemas import (
     UserCreate,
     UserResolveRequest,
     UserResponse,
+    MeResponse,
 )
 from app.services.analytics import AnalyticsService
 from app.dependencies.auth import (
@@ -119,6 +120,30 @@ async def get_current_user(
             detail="Identity is not mapped to a backend user; call /users/resolve first",
         )
     return user
+
+
+@router.get("/me", response_model=MeResponse)
+async def get_me(
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the resolved backend user with their platform links and sync status.
+
+    The identity comes from the verified X-External-Id header (forwarded by the
+    frontend server), never from a browser-supplied user id.
+    """
+    res = await db.execute(
+        select(User)
+        .where(User.external_id == external_id)
+        .options(selectinload(User.platform_links))
+    )
+    user = res.scalar_one_or_none()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Identity is not mapped to a backend user; call /users/resolve first",
+        )
+    return MeResponse.model_validate(user)
 
 
 @router.post("/users/resolve", response_model=UserResponse)
@@ -201,7 +226,24 @@ async def link_platform(
     if not handle:
         raise HTTPException(status_code=400, detail="handle must not be empty")
 
-    if payload.platform == "leetcode":
+    # Normalize + validate the handle against the live platform before saving.
+    # A bad handle stored here is the root cause of silent 0/0/0 syncs.
+    if payload.platform == "codeforces":
+        from app.adapters.codeforces import CodeforcesAPIError, CodeforcesAdapter
+
+        cf_adapter = CodeforcesAdapter()
+        try:
+            info = await cf_adapter.get_user_info(handle)
+            # Codeforces handles are case-insensitive; use the canonical casing
+            # returned by the API so links and leaderboards stay consistent.
+            handle = info.get("handle") or handle
+        except CodeforcesAPIError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Handle not found on Codeforces: {handle}",
+            )
+
+    elif payload.platform == "leetcode":
         # Validate the account before persisting the link. Without this, a display
         # name (e.g. "Hues_Of_Code") or a stale session cookie can be stored as a
         # "linked" account and later produce a silent 0/0/0 sync.
@@ -230,12 +272,25 @@ async def link_platform(
                 detail=f"Could not validate LeetCode account '{handle}': {exc}",
             )
 
+    # Optional LeetCode session cookie: accept the raw value, strip a leading
+    # "LEETCODE_SESSION=" and surrounding quotes, encrypt at rest, never return it.
+    raw_token = (payload.auth_token or "").strip()
+    if raw_token:
+        if raw_token.startswith('"') and raw_token.endswith('"') and len(raw_token) >= 2:
+            raw_token = raw_token[1:-1]
+        if raw_token.startswith("LEETCODE_SESSION="):
+            raw_token = raw_token[len("LEETCODE_SESSION=") :]
+        raw_token = raw_token.strip().strip('"').strip("'")
+
+    submissions_available = payload.platform != "leetcode" or bool(raw_token)
+
     link = PlatformLink(
         user_id=payload.user_id,
         platform=payload.platform,
         handle=handle,
-        auth_token=encrypt_token(payload.auth_token) if payload.auth_token else None,
+        auth_token=encrypt_token(raw_token) if raw_token else None,
         sync_status="queued",
+        submissions_available=submissions_available,
     )
     db.add(link)
     # Commit before scheduling: the background task opens its own session and

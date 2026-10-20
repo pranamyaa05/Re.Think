@@ -188,6 +188,31 @@ class CodeforcesSyncService:
             else:
                 raise ValueError(f"Unsupported platform '{platform}' for link {link_id}")
 
+            # Persist honest progress counts on the link so GET /platforms/{id}/status
+            # can report fetched vs newly inserted for the last sync. A re-sync of
+            # already-stored data yields fetched>0 with inserted=0, never a fake "0/0/0 completed".
+            async with async_session_factory() as session:
+                await session.execute(
+                    text("""
+                        UPDATE platform_links
+                        SET submissions_fetched = :sf,
+                            submissions_inserted = :si,
+                            contests_fetched = :cf,
+                            contests_inserted = :ci,
+                            problems_upserted = :pu
+                        WHERE id = :link_id
+                    """),
+                    {
+                        "sf": subs_fetched,
+                        "si": subs_inserted,
+                        "cf": contests_fetched,
+                        "ci": contests_inserted,
+                        "pu": upserted_problems,
+                        "link_id": link_id,
+                    },
+                )
+                await session.commit()
+
             # Release lease on success
             released = await self.release_lease(link_id, worker_id, status="synced")
             if not released:
