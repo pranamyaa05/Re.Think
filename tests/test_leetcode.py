@@ -120,8 +120,12 @@ async def test_leetcode_sync_no_cookie():
         user_id = user.id
         link_id = link.id
 
-    # 2. Mock LeetCode adapter contest ranking
+    # 2. Mock LeetCode adapter contest ranking and public profile validation
     mock_lc = LeetCodeAdapter()
+    mock_lc.get_user_profile = AsyncMock(return_value={
+        "username": "test_lc_handle",
+        "submitStats": {"acSubmissionNum": [{"difficulty": "All", "count": 0, "submissions": 0}]},
+    })
     mock_lc.get_user_contest_ranking = AsyncMock(return_value={
         "ranking": {"attendedContestsCount": 2, "rating": 1650.0},
         "history": [
@@ -144,7 +148,9 @@ async def test_leetcode_sync_no_cookie():
     stats = await sync_service.sync_link(link_id)
 
     # 3. Assertions
+    assert stats["contests_fetched"] == 2
     assert stats["contests_synced"] == 2
+    assert stats["submissions_fetched"] == 0
     assert stats["submissions_synced"] == 0
     assert stats["problems_upserted"] == 0
 
@@ -201,6 +207,13 @@ async def test_leetcode_sync_with_cookie_and_verdict_normalization():
         link_id = link.id
 
     mock_lc = LeetCodeAdapter()
+    mock_lc.get_authenticated_user = AsyncMock(
+        return_value={"username": "test_lc_cookie_user", "isSignedIn": True}
+    )
+    mock_lc.get_user_profile = AsyncMock(return_value={
+        "username": "test_lc_cookie_user",
+        "submitStats": {"acSubmissionNum": [{"difficulty": "All", "count": 1, "submissions": 2}]},
+    })
     mock_lc.get_user_contest_ranking = AsyncMock(return_value={"ranking": None, "history": []})
     s1_slug = f"test-p1-{user_id}"
     s2_slug = f"test-p2-{user_id}"
@@ -249,7 +262,11 @@ async def test_leetcode_sync_with_cookie_and_verdict_normalization():
     sync_service = CodeforcesSyncService(leetcode_adapter=mock_lc)
     stats = await sync_service.sync_link(link_id)
 
+    assert stats["submissions_fetched"] == 2
     assert stats["submissions_synced"] == 2
+    assert stats["submissions_newly_inserted"] == 2
+    assert stats["contests_fetched"] == 0
+    assert stats["contests_synced"] == 0
     assert stats["problems_upserted"] == 2
 
     # Verify DB state
@@ -380,6 +397,13 @@ async def test_leetcode_sync_idempotency_and_lease():
 
     s_slug = f"idempotent-slug-{user_id}"
     mock_lc = LeetCodeAdapter()
+    mock_lc.get_authenticated_user = AsyncMock(
+        return_value={"username": "idempotent_lc_handle", "isSignedIn": True}
+    )
+    mock_lc.get_user_profile = AsyncMock(return_value={
+        "username": "idempotent_lc_handle",
+        "submitStats": {"acSubmissionNum": [{"difficulty": "All", "count": 1, "submissions": 1}]},
+    })
     mock_lc.get_user_contest_ranking = AsyncMock(return_value={
         "ranking": None,
         "history": [
@@ -414,13 +438,23 @@ async def test_leetcode_sync_idempotency_and_lease():
 
     # 1. First sync run
     stats1 = await sync_service.sync_link(link_id)
+    assert stats1["submissions_fetched"] == 1
     assert stats1["submissions_synced"] == 1
+    assert stats1["submissions_newly_inserted"] == 1
+    assert stats1["contests_fetched"] == 1
     assert stats1["contests_synced"] == 1
+    assert stats1["contests_newly_inserted"] == 1
 
-    # 2. Second sync run (idempotency check)
+    # 2. Second sync run (idempotency check). The platform still returns the
+    # same rows, but nothing new is inserted. These two counts must never be
+    # conflated again.
     stats2 = await sync_service.sync_link(link_id)
+    assert stats2["submissions_fetched"] == 1
     assert stats2["submissions_synced"] == 0
+    assert stats2["submissions_newly_inserted"] == 0
+    assert stats2["contests_fetched"] == 1
     assert stats2["contests_synced"] == 0
+    assert stats2["contests_newly_inserted"] == 0
 
     # Verify no duplicate rows in DB
     async with async_session_factory() as session:
@@ -459,25 +493,34 @@ async def test_platform_link_api_with_auth_token():
     from app.config import settings
 
     username = f"api_lc_user_{datetime.now().timestamp()}"
-    headers = {"X-API-Key": settings.api_key}
+    external_id = f"ext_{datetime.now().timestamp()}"
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": external_id}
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         # Create user
-        u_res = await ac.post("/api/users", json={"username": username})
+        u_res = await ac.post(
+            "/api/users", json={"username": username, "external_id": external_id}
+        )
         assert u_res.status_code == 201
         user_id = u_res.json()["id"]
 
-        # Link LeetCode with auth_token
+        # Link LeetCode with auth_token. The link endpoint validates the cookie
+        # against LeetCode, so mock the identity lookup instead of using a fake
+        # token against the real API.
         secret_token = "my_super_secret_cookie_token_456"
-        link_res = await ac.post(
-            "/api/platforms/link",
-            json={
-                "user_id": user_id,
-                "platform": "leetcode",
-                "handle": "api_test_lc_handle",
-                "auth_token": secret_token,
-            }
-        )
+        with patch(
+            "app.adapters.leetcode.LeetCodeAdapter.get_authenticated_user",
+            new=AsyncMock(return_value={"username": "api_test_lc_handle", "isSignedIn": True}),
+        ), patch("app.routers.run_link_sync", new=AsyncMock()):
+            link_res = await ac.post(
+                "/api/platforms/link",
+                json={
+                    "user_id": user_id,
+                    "platform": "leetcode",
+                    "handle": "api_test_lc_handle",
+                    "auth_token": secret_token,
+                }
+            )
         assert link_res.status_code == 201
         link_id = link_res.json()["id"]
 
@@ -491,4 +534,113 @@ async def test_platform_link_api_with_auth_token():
         assert link_row.auth_token != secret_token
         assert "my_super_secret" not in link_row.auth_token
         assert decrypt_token(link_row.auth_token) == secret_token
+
+
+@pytest.mark.asyncio
+async def test_sync_fails_loudly_when_cookie_invalid_instead_of_returning_zero():
+    """
+    Regression for link 64/65: an expired LEETCODE_SESSION used to make
+    get_authenticated_user() return None; sync then queried a display-name
+    handle (Hues_Of_Code), got empty data, and reported status "completed"
+    with 0/0/0. It must now fail and persist a clear sync_error.
+    """
+    encrypted_cookie = encrypt_token("expired_session_cookie")
+
+    async with async_session_factory() as session:
+        user = User(username=f"lc_expired_cookie_{datetime.now().timestamp()}")
+        session.add(user)
+        await session.flush()
+
+        link = PlatformLink(
+            user_id=user.id,
+            platform="leetcode",
+            handle="Hues_Of_Code",  # display name, not the username
+            auth_token=encrypted_cookie,
+            sync_status="idle",
+        )
+        session.add(link)
+        await session.commit()
+        user_id = user.id
+        link_id = link.id
+
+    mock_lc = LeetCodeAdapter()
+    # Expired cookie: LeetCode replies HTTP 200 with isSignedIn=false.
+    mock_lc.get_authenticated_user = AsyncMock(return_value=None)
+    # If the code incorrectly continues, these would produce empty data.
+    mock_lc.get_user_contest_ranking = AsyncMock(return_value={"ranking": None, "history": []})
+    mock_lc.get_recent_submissions = AsyncMock(return_value=[])
+
+    service = CodeforcesSyncService(leetcode_adapter=mock_lc)
+    with pytest.raises(LeetCodeAPIError, match="cookie invalid or expired"):
+        await service.sync_link(link_id)
+
+    async with async_session_factory() as session:
+        row = (
+            await session.execute(select(PlatformLink).where(PlatformLink.id == link_id))
+        ).scalar_one()
+        assert row.sync_status == "failed"
+        assert row.sync_error is not None
+        assert "cookie invalid or expired" in row.sync_error
+        assert row.last_synced_at is None
+
+        subs_res = await session.execute(
+            select(Submission).where(Submission.user_id == user_id)
+        )
+        assert subs_res.scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_authenticated_empty_submission_response_fails_loudly():
+    """An empty submission list for a user whose profile shows solves is an error."""
+    async with async_session_factory() as session:
+        user = User(username=f"lc_empty_subs_{datetime.now().timestamp()}")
+        session.add(user)
+        await session.flush()
+
+        link = PlatformLink(
+            user_id=user.id,
+            platform="leetcode",
+            handle="empty_subs_handle",
+            auth_token=encrypt_token("some_session_cookie"),
+            sync_status="idle",
+        )
+        session.add(link)
+        await session.commit()
+        link_id = link.id
+
+    mock_lc = LeetCodeAdapter()
+    mock_lc.get_authenticated_user = AsyncMock(
+        return_value={"username": "empty_subs_handle", "isSignedIn": True}
+    )
+    mock_lc.get_user_profile = AsyncMock(return_value={
+        "username": "empty_subs_handle",
+        "submitStats": {"acSubmissionNum": [{"difficulty": "All", "count": 25, "submissions": 27}]},
+    })
+    mock_lc.get_user_contest_ranking = AsyncMock(return_value={"ranking": None, "history": []})
+    mock_lc.get_recent_submissions = AsyncMock(return_value=[])
+
+    service = CodeforcesSyncService(leetcode_adapter=mock_lc)
+    with pytest.raises(LeetCodeAPIError, match="no recent submissions"):
+        await service.sync_link(link_id)
+
+
+@pytest.mark.asyncio
+async def test_adapter_raises_on_graphql_errors_even_with_partial_data():
+    """GraphQL HTTP 200 + errors + partial data must not be treated as success."""
+    adapter = LeetCodeAdapter()
+
+    mock_resp = AsyncMock()
+    mock_resp.status_code = 200
+    mock_resp.text = ""
+    mock_resp.json = lambda: {
+        "errors": [{"message": "That user does not exist."}],
+        "data": {"matchedUser": None},
+    }
+
+    async def mock_post(client_self, url, json=None, headers=None, **kwargs):
+        return mock_resp
+
+    with patch("httpx.AsyncClient.post", new=mock_post):
+        with pytest.raises(LeetCodeAPIError, match="That user does not exist"):
+            await adapter.get_user_profile("Hues_Of_Code")
 

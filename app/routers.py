@@ -1,8 +1,12 @@
 """FastAPI route definitions for users, platform links, sync, submissions, contests, and problems."""
 
+import logging
+from datetime import date as date_type
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -13,12 +17,15 @@ from app.models.hint_session import HintSession
 from app.models.platform_link import PlatformLink
 from app.models.problem import Problem
 from app.models.problem_knowledge import ProblemKnowledge
+from app.models.recommendation import Recommendation
+from app.models.reflection import Reflection
 from app.models.submission import Submission
 from app.models.user import User
 from app.models.user_analytics import UserAnalytics
 from app.schemas import (
     AnalyticsRecomputeResponse,
     AnalyticsSummaryResponse,
+    CoachSessionListItem,
     ContestMetricsResponse,
     ContestPerformanceResponse,
     DifficultyBucket,
@@ -29,6 +36,7 @@ from app.schemas import (
     KnowledgeVerifyRequest,
     PlatformLinkCreate,
     PlatformLinkResponse,
+    ReflectionListItem,
     ProblemKnowledgeResponse,
     ProblemResponse,
     SessionConcludeRequest,
@@ -39,16 +47,40 @@ from app.schemas import (
     SyncTriggerResponse,
     TopicAnalyticsResponse,
     UserCreate,
+    UserResolveRequest,
     UserResponse,
 )
 from app.services.analytics import AnalyticsService
-from app.dependencies.auth import verify_api_key
+from app.dependencies.auth import (
+    assert_link_owner,
+    get_verified_identity,
+    require_user_scope,
+    verify_api_key,
+)
 from app.services.coach import CoachService
 from app.services.editorial import EditorialService, resolve_coach_mode
 from app.services.sync import CodeforcesSyncService, SyncAlreadyRunningError
 from app.utils.crypto import encrypt_token
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api", dependencies=[Depends(verify_api_key)])
+
+
+async def run_link_sync(link_id: int) -> None:
+    """Background entrypoint: sync one link and record failures on the link row.
+
+    ``CodeforcesSyncService.sync_link`` acquires the lease, writes
+    ``sync_status='failed'`` plus the verbatim error on failure, and rebuilds
+    analytics on success, so this wrapper only has to keep the task alive.
+    """
+    sync_service = CodeforcesSyncService()
+    try:
+        await sync_service.sync_link(link_id)
+    except SyncAlreadyRunningError:
+        logger.info("Background sync for link %s skipped: lease already held", link_id)
+    except Exception:
+        logger.exception("Background sync failed for link %s", link_id)
 
 
 # ── Users ─────────────────────────────────────────────────────────────
@@ -59,13 +91,11 @@ async def create_user(payload: UserCreate, db: AsyncSession = Depends(get_db)):
     if res.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    user = User(username=payload.username)
+    user = User(username=payload.username, external_id=payload.external_id)
     db.add(user)
     await db.flush()
     return user
 
-
-@router.get("/users/{user_id}", response_model=UserResponse)
 async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
     query = select(User).where(User.id == user_id)
     res = await db.execute(query)
@@ -75,12 +105,90 @@ async def get_user(user_id: int, db: AsyncSession = Depends(get_db)):
     return user
 
 
+@router.get("/users/me", response_model=UserResponse)
+async def get_current_user(
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the backend user mapped to the verified OAuth identity."""
+    res = await db.execute(select(User).where(User.external_id == external_id))
+    user = res.scalar_one_or_none()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Identity is not mapped to a backend user; call /users/resolve first",
+        )
+    return user
+
+
+@router.post("/users/resolve", response_model=UserResponse)
+async def resolve_user_by_external_id(
+    payload: UserResolveRequest,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve a user by their external OAuth identity (idempotent).
+
+    Returns the existing backend user mapped to this external_id, or creates
+    one if none exists. The body identity must match the verified header, so
+    a server-side caller cannot resolve an identity it does not represent.
+    """
+    if payload.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="external_id does not match the verified identity",
+        )
+
+    query = select(User).where(User.external_id == external_id)
+    user = (await db.execute(query)).scalar_one_or_none()
+    if user:
+        return user
+
+    username = (payload.username or "").strip() or f"oauth_{external_id}"
+    user = User(username=username, external_id=external_id)
+    db.add(user)
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Concurrent resolve (or a username collision): roll back the failed
+        # insert and return the row the winner created.
+        await db.rollback()
+        user = (await db.execute(query)).scalar_one_or_none()
+        if user:
+            return user
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{username}' is already taken; retry with a different username",
+        )
+    return user
+
+
+@router.get("/users/{user_id}", response_model=UserResponse)
+async def get_user_endpoint(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
+    user = await get_user(user_id, db)
+    return user
+
 # ── Platform Links ───────────────────────────────────────────────────
 @router.post("/platforms/link", response_model=PlatformLinkResponse, status_code=status.HTTP_201_CREATED)
-async def link_platform(payload: PlatformLinkCreate, db: AsyncSession = Depends(get_db)):
+async def link_platform(
+    payload: PlatformLinkCreate,
+    background_tasks: BackgroundTasks,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
     user_q = select(User).where(User.id == payload.user_id)
-    if not (await db.execute(user_q)).scalar_one_or_none():
+    user = (await db.execute(user_q)).scalar_one_or_none()
+    if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if user.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: identity does not own this user",
+        )
 
     existing_q = select(PlatformLink).where(
         PlatformLink.user_id == payload.user_id,
@@ -89,59 +197,127 @@ async def link_platform(payload: PlatformLinkCreate, db: AsyncSession = Depends(
     if (await db.execute(existing_q)).scalar_one_or_none():
         raise HTTPException(status_code=400, detail=f"Platform '{payload.platform}' already linked for this user")
 
-    handle = payload.handle
-    if payload.platform == "leetcode" and payload.auth_token:
+    handle = (payload.handle or "").strip()
+    if not handle:
+        raise HTTPException(status_code=400, detail="handle must not be empty")
+
+    if payload.platform == "leetcode":
+        # Validate the account before persisting the link. Without this, a display
+        # name (e.g. "Hues_Of_Code") or a stale session cookie can be stored as a
+        # "linked" account and later produce a silent 0/0/0 sync.
+        from app.adapters.leetcode import LeetCodeAPIError, LeetCodeAdapter
+
+        lc_adapter = LeetCodeAdapter()
         try:
-            from app.adapters.leetcode import LeetCodeAdapter
-            lc_adapter = LeetCodeAdapter()
-            auth_user = await lc_adapter.get_authenticated_user(payload.auth_token)
-            if auth_user and auth_user.get("username"):
+            if payload.auth_token:
+                auth_user = await lc_adapter.get_authenticated_user(payload.auth_token)
+                if not auth_user or not auth_user.get("username"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "LeetCode cookie invalid or expired; paste a fresh "
+                            "LEETCODE_SESSION cookie"
+                        ),
+                    )
                 handle = auth_user["username"]
-        except Exception:
-            pass
+            else:
+                profile = await lc_adapter.get_user_profile(handle)
+                # Use LeetCode's canonical casing (handles are case-insensitive).
+                handle = profile.get("username") or handle
+        except LeetCodeAPIError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not validate LeetCode account '{handle}': {exc}",
+            )
 
     link = PlatformLink(
         user_id=payload.user_id,
         platform=payload.platform,
         handle=handle,
         auth_token=encrypt_token(payload.auth_token) if payload.auth_token else None,
-        sync_status="idle",
+        sync_status="queued",
     )
     db.add(link)
-    await db.flush()
+    # Commit before scheduling: the background task opens its own session and
+    # must see the new row, and the response must return immediately.
+    await db.commit()
+    await db.refresh(link)
+    background_tasks.add_task(run_link_sync, link.id)
     return link
 
 
+@router.get("/platforms", response_model=List[PlatformLinkResponse])
+async def list_platform_links(
+    user_id: int = Query(...),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
+    """List the platform links owned by the verified user."""
+    stmt = (
+        select(PlatformLink)
+        .where(PlatformLink.user_id == user_id)
+        .order_by(PlatformLink.id.asc())
+    )
+    res = await db.execute(stmt)
+    return list(res.scalars().all())
+
+
 @router.delete("/platforms/{link_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def unlink_platform(link_id: int, db: AsyncSession = Depends(get_db)):
+async def unlink_platform(
+    link_id: int,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
     query = select(PlatformLink).where(PlatformLink.id == link_id)
     link = (await db.execute(query)).scalar_one_or_none()
     if not link:
         raise HTTPException(status_code=404, detail="Platform link not found")
+    await assert_link_owner(db, external_id, link)
     await db.delete(link)
     return None
 
 
 @router.get("/platforms/{link_id}/status", response_model=PlatformLinkResponse)
-async def get_platform_status(link_id: int, db: AsyncSession = Depends(get_db)):
+async def get_platform_status(
+    link_id: int,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
     query = select(PlatformLink).where(PlatformLink.id == link_id)
     link = (await db.execute(query)).scalar_one_or_none()
     if not link:
         raise HTTPException(status_code=404, detail="Platform link not found")
+    await assert_link_owner(db, external_id, link)
     return link
 
 
 @router.post("/platforms/{link_id}/sync", response_model=SyncTriggerResponse)
-async def trigger_platform_sync(link_id: int, force_full: bool = Query(False)):
+async def trigger_platform_sync(
+    link_id: int,
+    force_full: bool = Query(False),
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    link = (
+        await db.execute(select(PlatformLink).where(PlatformLink.id == link_id))
+    ).scalar_one_or_none()
+    if not link:
+        raise HTTPException(status_code=404, detail="Platform link not found")
+    await assert_link_owner(db, external_id, link)
     sync_service = CodeforcesSyncService()
     try:
         stats = await sync_service.sync_link(link_id, force_full=force_full)
         return SyncTriggerResponse(
             status="completed",
             link_id=link_id,
+            user_id=stats["user_id"],
+            submissions_fetched=stats["submissions_fetched"],
+            submissions_newly_inserted=stats["submissions_newly_inserted"],
+            contests_fetched=stats["contests_fetched"],
+            contests_newly_inserted=stats["contests_newly_inserted"],
+            problems_upserted=stats["problems_upserted"],
             submissions_synced=stats["submissions_synced"],
             contests_synced=stats["contests_synced"],
-            problems_upserted=stats["problems_upserted"],
         )
     except SyncAlreadyRunningError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -159,6 +335,7 @@ async def list_submissions(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
 ):
     stmt = select(Submission).where(Submission.user_id == user_id)
     if verdict:
@@ -176,6 +353,7 @@ async def list_contests(
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
 ):
     stmt = (
         select(ContestPerformance)
@@ -214,7 +392,11 @@ async def list_problems(
 
 # ── Analytics ─────────────────────────────────────────────────────────
 @router.post("/analytics/{user_id}/recompute", response_model=AnalyticsRecomputeResponse)
-async def recompute_analytics(user_id: int, db: AsyncSession = Depends(get_db)):
+async def recompute_analytics(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
     user_res = await db.execute(select(User).where(User.id == user_id))
     if not user_res.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="User not found")
@@ -234,7 +416,11 @@ async def recompute_analytics(user_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/analytics/{user_id}/summary", response_model=AnalyticsSummaryResponse)
-async def get_analytics_summary(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_analytics_summary(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
     res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
     record = res.scalar_one_or_none()
     if not record:
@@ -277,6 +463,7 @@ async def get_topic_analytics(
     sort_by: str = Query("level", pattern="^(level|freshness|completion|name)$"),
     order: str = Query("desc", pattern="^(asc|desc)$"),
     db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
 ):
     res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
     record = res.scalar_one_or_none()
@@ -308,7 +495,11 @@ async def get_topic_analytics(
 
 
 @router.get("/analytics/{user_id}/difficulty", response_model=DifficultyDistributionResponse)
-async def get_difficulty_distribution(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_difficulty_distribution(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
     res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
     record = res.scalar_one_or_none()
     if not record:
@@ -327,7 +518,11 @@ async def get_difficulty_distribution(user_id: int, db: AsyncSession = Depends(g
 
 
 @router.get("/analytics/{user_id}/contests", response_model=ContestMetricsResponse)
-async def get_contest_analytics(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_contest_analytics(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
     res = await db.execute(select(UserAnalytics).where(UserAnalytics.user_id == user_id))
     record = res.scalar_one_or_none()
     if not record:
@@ -424,7 +619,17 @@ async def verify_problem_knowledge(id: int, payload: KnowledgeVerifyRequest, db:
 
 # ── Phase 3 Socratic Coach Endpoints ─────────────────────────────────
 @router.post("/coach/sessions", response_model=HintSessionDetailResponse, status_code=status.HTTP_201_CREATED)
-async def create_coach_session(payload: SessionCreateRequest):
+async def create_coach_session(
+    payload: SessionCreateRequest,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    owner = (await db.execute(select(User).where(User.id == payload.user_id))).scalar_one_or_none()
+    if not owner or owner.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: identity does not own this user",
+        )
     coach_service = CoachService()
     try:
         session = await coach_service.create_session(
@@ -436,8 +641,44 @@ async def create_coach_session(payload: SessionCreateRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@router.get("/coach/sessions", response_model=List[CoachSessionListItem])
+async def list_coach_sessions(
+    user_id: int = Query(...),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
+    stmt = (
+        select(HintSession, Problem.title)
+        .join(Problem, Problem.id == HintSession.problem_id)
+        .where(HintSession.user_id == user_id)
+        .order_by(HintSession.last_activity_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+    return [
+        CoachSessionListItem(
+            id=s.id,
+            problem_id=s.problem_id,
+            problem_title=title,
+            current_level=s.current_level,
+            coach_mode=s.coach_mode,
+            outcome=s.outcome,
+            started_at=s.started_at,
+            last_activity_at=s.last_activity_at,
+        )
+        for s, title in rows
+    ]
+
+
 @router.get("/coach/sessions/{session_id}", response_model=HintSessionDetailResponse)
-async def get_coach_session(session_id: int, db: AsyncSession = Depends(get_db)):
+async def get_coach_session(
+    session_id: int,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
     res = await db.execute(
         select(HintSession)
         .options(selectinload(HintSession.messages), selectinload(HintSession.problem))
@@ -446,11 +687,33 @@ async def get_coach_session(session_id: int, db: AsyncSession = Depends(get_db))
     session = res.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail=f"HintSession id={session_id} not found")
+    owner = (await db.execute(select(User).where(User.id == session.user_id))).scalar_one_or_none()
+    if not owner or owner.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: identity does not own this coaching session",
+        )
     return session
 
 
 @router.post("/coach/sessions/{session_id}/message", response_model=SessionMessageResponse)
-async def send_coach_message(session_id: int, payload: SessionMessageRequest):
+async def send_coach_message(
+    session_id: int,
+    payload: SessionMessageRequest,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    session_row = (
+        await db.execute(select(HintSession).where(HintSession.id == session_id))
+    ).scalar_one_or_none()
+    if not session_row:
+        raise HTTPException(status_code=404, detail=f"HintSession id={session_id} not found")
+    owner = (await db.execute(select(User).where(User.id == session_row.user_id))).scalar_one_or_none()
+    if not owner or owner.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: identity does not own this coaching session",
+        )
     coach_service = CoachService()
     try:
         coach_msg, updated_session = await coach_service.process_user_message(
@@ -470,7 +733,23 @@ async def send_coach_message(session_id: int, payload: SessionMessageRequest):
 
 
 @router.post("/coach/sessions/{session_id}/conclude", response_model=HintSessionDetailResponse)
-async def conclude_coach_session(session_id: int, payload: SessionConcludeRequest):
+async def conclude_coach_session(
+    session_id: int,
+    payload: SessionConcludeRequest,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    session_row = (
+        await db.execute(select(HintSession).where(HintSession.id == session_id))
+    ).scalar_one_or_none()
+    if not session_row:
+        raise HTTPException(status_code=404, detail=f"HintSession id={session_id} not found")
+    owner = (await db.execute(select(User).where(User.id == session_row.user_id))).scalar_one_or_none()
+    if not owner or owner.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: identity does not own this coaching session",
+        )
     coach_service = CoachService()
     try:
         session = await coach_service.conclude_session(
@@ -498,7 +777,11 @@ from app.schemas import (
 
 
 @router.post("/recommendations/{user_id}/problem", response_model=RecommendationResponse)
-async def generate_problem_recommendation(user_id: int, db: AsyncSession = Depends(get_db)):
+async def generate_problem_recommendation(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
     """Generate and persist a problem or study recommendation for the user."""
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not user:
@@ -508,7 +791,11 @@ async def generate_problem_recommendation(user_id: int, db: AsyncSession = Depen
 
 
 @router.get("/recommendations/{user_id}", response_model=List[RecommendationListItem])
-async def get_active_recommendations(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_active_recommendations(
+    user_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
     """List all active recommendations for the user."""
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not user:
@@ -517,8 +804,23 @@ async def get_active_recommendations(user_id: int, db: AsyncSession = Depends(ge
 
 
 @router.post("/recommendations/{recommendation_id}/dismiss", response_model=DismissResponse)
-async def dismiss_rec(recommendation_id: int):
-    """Dismiss a recommendation by ID."""
+async def dismiss_rec(
+    recommendation_id: int,
+    external_id: str = Depends(get_verified_identity),
+    db: AsyncSession = Depends(get_db),
+):
+    """Dismiss a recommendation by ID (owner only)."""
+    rec = (
+        await db.execute(select(Recommendation).where(Recommendation.id == recommendation_id))
+    ).scalar_one_or_none()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    owner = (await db.execute(select(User).where(User.id == rec.user_id))).scalar_one_or_none()
+    if not owner or owner.external_id != external_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: identity does not own this recommendation",
+        )
     result = await dismiss_recommendation(recommendation_id)
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Recommendation not found")
@@ -536,6 +838,7 @@ async def generate_reflection(
     user_id: int,
     date: Optional[str] = Query(None, description="Date in YYYY-MM-DD format, defaults to today"),
     db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
 ):
     """Generate (or return existing) daily reflection for user_id on given date."""
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
@@ -554,11 +857,45 @@ async def generate_reflection(
     return result
 
 
+@router.get("/reflections", response_model=List[ReflectionListItem])
+async def list_reflections(
+    user_id: int = Query(...),
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
+):
+    """List reflections for the owner, optionally filtered by date range."""
+    stmt = select(Reflection).where(Reflection.user_id == user_id)
+    try:
+        if from_date:
+            stmt = stmt.where(Reflection.date >= date_type.fromisoformat(from_date))
+        if to_date:
+            stmt = stmt.where(Reflection.date <= date_type.fromisoformat(to_date))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+    stmt = stmt.order_by(Reflection.date.desc()).offset(offset).limit(limit)
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [
+        ReflectionListItem(
+            id=r.id,
+            date=r.date.isoformat(),
+            content=r.content,
+            metrics=r.metrics or {},
+            generated_at=r.generated_at,
+        )
+        for r in rows
+    ]
+
+
 @router.get("/reflections/{user_id}/{date}", response_model=ReflectionResponse)
 async def get_reflection_by_date(
     user_id: int,
     date: str,
     db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_user_scope),
 ):
     """Retrieve an existing reflection for user_id on the given date."""
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()

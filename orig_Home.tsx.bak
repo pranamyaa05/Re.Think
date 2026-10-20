@@ -1,0 +1,304 @@
+import { useEffect, useState } from "react";
+import {
+  ArrowDownRight,
+  ArrowRight,
+  ArrowUpRight,
+  BookOpen,
+  Check,
+  ChevronRight,
+  Code2,
+  Flame,
+  Menu,
+  MessageCircle,
+  Sparkles,
+  X,
+} from "lucide-react";
+import DailyQuote from "../components/DailyQuote";
+import DancingText from "../components/DancingText";
+
+const logoSrc = "/manus-storage/async-images/bbayoqbWyThrgAeme5JHkU/image-1.webp";
+
+function Brand({ inverse = false }: { inverse?: boolean }) {
+  return (
+    <a className={`brand${inverse ? " brand-inverse" : ""}`} href="#top" aria-label="Re.think() home">
+      <img className="brand-icon" src={logoSrc} alt="" onError={(event) => { event.currentTarget.src = "/rethink-icon.png"; }} />
+      <span className="brand-wordmark"><DancingText text="Re.think" /><span className="brand-parens"><DancingText text="()" /></span></span>
+    </a>
+  );
+}
+
+function BookHeroArtwork() {
+  return (
+    <div className="book-hero-art">
+      <div className="book-art-frame motion-spotlight tilt-card">
+        <img src="/images/book-wheel.png" alt="A sculptural wheel of open book pages, turning one idea into another" />
+        <div className="book-image-wash" />
+        <div className="book-image-caption"><span>AN OPEN BOOK, AN OPEN MIND</span><strong>There is always<br />another way in.</strong></div>
+        <span className="book-image-tab">A NOTE TO KEEP</span>
+      </div>
+      <div className="book-margin-note"><span className="margin-spark">✳</span><span><strong>Read. Pause. Rethink.</strong><small>A thought can take its time.</small></span></div>
+      <span className="book-art-side-note">A LITTLE ROOM FOR YOUR NEXT IDEA</span>
+    </div>
+  );
+}
+
+function DemoBadge({ children = "Illustrative demo data" }: { children?: string }) {
+  return <span className="demo-badge"><span className="demo-dot" />{children}</span>;
+}
+
+function TrendChart() {
+  return (
+    <svg className="trend-chart" viewBox="0 0 470 115" role="img" aria-label="Illustrative weekly practice trend rising over seven days">
+      <defs>
+        <linearGradient id="areaFill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor="#71a18b" stopOpacity=".25" />
+          <stop offset="100%" stopColor="#71a18b" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {[22, 54, 86].map((y) => <line key={y} x1="0" x2="470" y1={y} y2={y} className="chart-grid" />)}
+      <path d="M0 94 C35 91 38 72 76 76 S122 82 152 60 S205 72 231 48 S277 65 308 38 S360 53 389 28 S431 39 470 10 L470 115 L0 115Z" fill="url(#areaFill)" />
+      <path d="M0 94 C35 91 38 72 76 76 S122 82 152 60 S205 72 231 48 S277 65 308 38 S360 53 389 28 S431 39 470 10" className="chart-line" />
+      <circle cx="470" cy="10" r="5" className="chart-point" />
+    </svg>
+  );
+}
+
+const heatmap = [
+  [0, 1, 2, 0, 1, 3, 2],
+  [1, 2, 0, 3, 2, 1, 0],
+  [2, 3, 1, 2, 0, 3, 1],
+  [0, 2, 3, 1, 2, 0, 3],
+];
+
+function DashboardPreview() {
+  return (
+    <div className="dashboard-wrap" id="dashboard" aria-label="Illustrative progress dashboard preview">
+      <div className="dashboard-orbit orbit-one" />
+      <div className="dashboard-orbit orbit-two" />
+      <div className="float-note note-top"><span className="float-note-icon"><Sparkles size={15} /></span><span><strong>Little by little</strong><small>it really adds up</small></span></div>
+      <div className="dashboard-card motion-spotlight tilt-card">
+        <div className="dash-topline">
+          <div className="dash-hello"><span className="avatar">s</span><span><small>A little progress goes a long way</small><strong>Hey, Sam <span className="wave">✳</span></strong></span></div>
+          <span className="demo-mini"><span /> DEMO</span>
+        </div>
+        <div className="dash-intro"><div><span className="eyebrow">YOUR WEEK, AT A GLANCE</span><h3>You're finding<br />your rhythm.</h3></div><div className="week-pill">Sep 21 — 27 <ChevronRight size={14} /></div></div>
+        <div className="dash-stats">
+          <div className="dash-stat"><span className="stat-icon mint"><Code2 size={16} /></span><span className="stat-label">Solved this week</span><strong>12 <small>problems</small></strong><span className="stat-change"><ArrowUpRight size={13} /> +4 from last week</span></div>
+          <div className="dash-stat"><span className="stat-icon apricot"><Flame size={16} /></span><span className="stat-label">Current streak</span><strong>6 <small>days</small></strong><span className="stat-change stat-neutral">You're showing up.</span></div>
+        </div>
+        <div className="chart-block"><div className="chart-heading"><span>Practice momentum</span><span className="chart-period">LAST 7 DAYS</span></div><TrendChart /><div className="chart-days"><span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span></div></div>
+        <div className="platform-row"><div className="platform-mini lc-mini"><span className="platform-mark lc-mark">L</span><span><small>LeetCode</small><strong>8 solved</strong></span><span className="platform-arrow"><ArrowUpRight size={14} /></span></div><div className="platform-mini cf-mini"><span className="platform-mark cf-mark">⌘</span><span><small>Codeforces</small><strong>4 solved</strong></span><span className="platform-arrow"><ArrowUpRight size={14} /></span></div></div>
+        <span className="dashboard-disclaimer">Fictional sample data · not connected to any account</span>
+      </div>
+      <div className="float-note note-bottom"><span className="streak-spark">✦</span><span><strong>6 days in a row</strong><small>that's a lovely habit</small></span></div>
+    </div>
+  );
+}
+
+const features = [
+  { icon: BookOpen, label: "Take the long way, if you like", title: "Explanations worth sitting with.", copy: "Find a fresh way into the idea, read a hint, then let the pattern settle before you move on.", tone: "feature-mint" },
+  { icon: MessageCircle, label: "Ask without the awkward", title: "A question is a good place to start.", copy: "Stuck on a tricky edge case? Ask for a nudge, a clearer example, or one more gentle explanation.", tone: "feature-lilac" },
+  { icon: Code2, label: "Keep your bookmark", title: "See the chapters adding up.", copy: "Bring LeetCode and Codeforces practice together, then notice the small habits that are becoming yours.", tone: "feature-peach" },
+];
+
+function CoachDemo() {
+  const [showAnswer, setShowAnswer] = useState(false);
+  return (
+    <div className="coach-demo motion-spotlight tilt-card" id="coach-demo">
+      <div className="coach-demo-top"><div className="coach-identity"><span className="coach-avatar"><BookOpen size={16} /></span><span><strong>Notes in the margin</strong><small>A sample coaching moment</small></span></div><DemoBadge>Sample response</DemoBadge></div>
+      <div className="chat-message learner-message"><span className="chat-avatar learner-avatar">S</span><p>I'm rereading two-sum. Could I get a small hint?</p></div>
+      <div className="chat-message coach-message"><span className="chat-avatar coach-chat-avatar"><Sparkles size={13} /></span><div><span className="coach-label">A LITTLE NUDGE <i>· sample response</i></span><p>As you read through the numbers, what small note could you keep—so you don't have to compare every pair?</p><p className="coach-prompt">No rush. Sometimes the idea needs a second read.</p></div></div>
+      {showAnswer && <div className="reveal-answer" role="status"><span className="reveal-check"><Check size={14} /></span><span><strong>A possible next thought</strong><small>Keep a map of the numbers you've seen. For each one, check whether its complement is already there.</small></span></div>}
+      <button type="button" className="hint-button" onClick={() => setShowAnswer((shown) => !shown)} aria-expanded={showAnswer}>{showAnswer ? "Close this margin note" : "Turn to one more hint"}<ArrowRight size={15} /></button>
+      <div className="coach-demo-foot"><span>✳</span> Sample interaction · no live AI connection</div>
+    </div>
+  );
+}
+
+const learners = [
+  { rank: "01", name: "Mira L.", detail: "steady and curious", solved: "32", streak: "11 days", tone: "rank-gold" },
+  { rank: "02", name: "You, perhaps", detail: "your pace, your path", solved: "26", streak: "6 days", tone: "rank-silver" },
+  { rank: "03", name: "Arjun R.", detail: "one step at a time", solved: "21", streak: "4 days", tone: "rank-bronze" },
+];
+
+function LeaderboardPreview() {
+  return (
+    <div className="leaderboard-card motion-spotlight tilt-card">
+      <div className="leaderboard-head"><div><span className="eyebrow">A FRIENDLY LITTLE SNAPSHOT</span><h3>Progress, not pressure.</h3></div><span className="leaderboard-icon"><ArrowDownRight size={19} /></span></div>
+      <div className="leaderboard-labels"><span>LEARNER</span><span>PROBLEMS</span><span>RHYTHM</span></div>
+      {learners.map((learner) => <div className={`leaderboard-row ${learner.name.startsWith("You") ? "your-row" : ""}`} key={learner.rank}><span className={`rank-number ${learner.tone}`}>{learner.rank}</span><span className="learner-info"><strong>{learner.name}</strong><small>{learner.detail}</small></span><strong className="solved-count">{learner.solved}</strong><span className="streak-pill"><Flame size={12} />{learner.streak}</span></div>)}
+      <div className="board-foot"><DemoBadge>Fictional learners · sample values</DemoBadge><span className="board-platforms">LeetCode <i>+</i> Codeforces</span></div>
+    </div>
+  );
+}
+
+function App() {
+  const [menuOpen, setMenuOpen] = useState(false);
+  useEffect(() => {
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const revealTargets = Array.from(document.querySelectorAll<HTMLElement>(
+      ".hero-copy, .book-art-frame, .book-margin-note, .intro-grid, .coach-heading, .coach-demo, .feature-item, .quote-content, .progress-heading, .dashboard-card, .progress-insight-card, .leaderboard-card, .step-card, .closing-card",
+    ));
+    const pointerTargets = Array.from(document.querySelectorAll<HTMLElement>(
+      ".hero-section, .motion-spotlight, .tilt-card",
+    ));
+    let observer: IntersectionObserver | undefined;
+
+    if (!reducedMotion && "IntersectionObserver" in window) {
+      document.documentElement.classList.add("motion-ready");
+      revealTargets.forEach((target) => target.classList.add("motion-reveal"));
+      observer = new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("is-visible");
+            observer?.unobserve(entry.target);
+          }
+        });
+      }, { threshold: 0.12, rootMargin: "0px 0px -24px 0px" });
+      revealTargets.forEach((target) => observer?.observe(target));
+    }
+
+    const trackPointer = (event: PointerEvent) => {
+      if (event.pointerType !== "mouse" || reducedMotion) return;
+      const target = event.currentTarget;
+      if (!(target instanceof HTMLElement)) return;
+      const bounds = target.getBoundingClientRect();
+      if (!bounds.width || !bounds.height) return;
+      const x = event.clientX - bounds.left;
+      const y = event.clientY - bounds.top;
+      target.style.setProperty("--spot-x", `${x}px`);
+      target.style.setProperty("--spot-y", `${y}px`);
+      if (target.classList.contains("hero-section")) {
+        target.classList.add("cursor-active");
+        target.style.setProperty("--grid-x", `${Math.round(x * 0.035)}px`);
+        target.style.setProperty("--grid-y", `${Math.round(y * 0.035)}px`);
+      }
+      if (target.classList.contains("tilt-card")) {
+        const fromCenterX = (x / bounds.width - 0.5) * 2;
+        const fromCenterY = (y / bounds.height - 0.5) * 2;
+        const maxTilt = target.classList.contains("book-art-frame") ? 4 : 3;
+        target.classList.add("is-pointer-active");
+        target.style.setProperty("--tilt-x", `${-fromCenterY * maxTilt}deg`);
+        target.style.setProperty("--tilt-y", `${fromCenterX * maxTilt}deg`);
+        target.style.setProperty("--pull-x", `${fromCenterX * 2.6}px`);
+        target.style.setProperty("--pull-y", `${fromCenterY * 2.2}px`);
+      }
+    };
+    const clearPointer = (event: PointerEvent) => {
+      if (!(event.currentTarget instanceof HTMLElement)) return;
+      const target = event.currentTarget;
+      target.classList.remove("cursor-active", "is-pointer-active");
+      ["--spot-x", "--spot-y", "--grid-x", "--grid-y", "--tilt-x", "--tilt-y", "--pull-x", "--pull-y"].forEach((property) => target.style.removeProperty(property));
+    };
+    pointerTargets.forEach((target) => {
+      target.addEventListener("pointermove", trackPointer);
+      target.addEventListener("pointerleave", clearPointer);
+    });
+
+    return () => {
+      observer?.disconnect();
+      document.documentElement.classList.remove("motion-ready");
+      pointerTargets.forEach((target) => {
+        target.removeEventListener("pointermove", trackPointer);
+        target.removeEventListener("pointerleave", clearPointer);
+      });
+    };
+  }, []);
+  const closeMenu = () => setMenuOpen(false);
+
+  return (
+    <div className="site-shell" id="top">
+      <header className="site-header">
+        <div className="nav-shell">
+          <Brand />
+          <button className="mobile-menu-button" type="button" aria-label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}>{menuOpen ? <X size={21} /> : <Menu size={21} />}</button>
+          <nav className={menuOpen ? "main-nav nav-open" : "main-nav"} aria-label="Main navigation">
+            <a href="#how-it-works" onClick={closeMenu}>The reading room</a>
+            <a href="#your-progress" onClick={closeMenu}>Your progress</a>
+            <a href="#a-little-help" onClick={closeMenu}>A little help</a>
+            <a className="nav-cta" href="#explore" onClick={closeMenu}>Turn the page <ArrowRight size={15} /></a>
+          </nav>
+        </div>
+      </header>
+
+      <main>
+        <section className="hero-section">
+          <div className="hero-container">
+            <div className="hero-copy">
+              <div className="hero-kicker"><span className="kicker-star">✳</span> A bookish take on your coding coach</div>
+              <h1>Read your way<br />to the <em>aha.</em></h1>
+              <p className="hero-lede">Some ideas need a second read, a helpful hint, or the right question. Re.think() gives your learning room to unfold — one thoughtful page at a time.</p>
+              <p className="hero-support">A calmer coding companion, with your LeetCode and Codeforces progress waiting in the wings.</p>
+              <div className="hero-actions">
+                <a className="button button-primary" href="#how-it-works">Step inside <ArrowRight size={17} /></a>
+                <a className="button button-quiet" href="#your-progress">See your progress <ChevronRight size={16} /></a>
+              </div>
+              <div className="hero-note"><span className="note-check"><Check size={12} /></span><span>Good ideas deserve a second read.</span></div>
+            </div>
+            <BookHeroArtwork />
+          </div>
+          <div className="hero-bottom"><span className="hero-bottom-line" /><span>Turn a page. Find another way in.</span><span className="hero-bottom-line" /></div>
+        </section>
+
+        <section className="intro-section section-pad" id="how-it-works">
+          <div className="section-container intro-grid">
+            <div className="section-index">01 <span>— A PAGE AT A TIME</span></div>
+            <div className="intro-main">
+              <p className="eyebrow">LESS PRESSURE. MORE ROOM TO UNDERSTAND.</p>
+              <h2>Some ideas are<br /><em>better read twice.</em></h2>
+              <p className="intro-copy">Competitive programming is the subject. Reading, reflection, and the small click of understanding are the experience. Ask what you like, follow a hint, or return to the explanation when you're ready.</p>
+              <a className="text-link" href="#a-little-help">Read a sample margin note <ArrowRight size={16} /></a>
+            </div>
+            <div className="intro-aside motion-spotlight tilt-card"><span className="aside-quote-mark">“</span><p>You don't need a whole new brain. Just another way into the idea.</p><span className="aside-attribution">A little reminder from Re.think()</span><div className="aside-doodle">✳ <span>· · · · ·</span> ✳</div></div>
+          </div>
+        </section>
+
+        <section className="coach-section section-pad" id="a-little-help">
+          <div className="section-container">
+            <div className="coach-heading">
+              <div><div className="section-index">02 <span>— NOTES IN THE MARGIN</span></div><p className="eyebrow">A GOOD EXPLANATION DOESN'T SHOUT</p><h2>Ask the question.<br /><em>Keep the confidence.</em></h2></div>
+              <p className="coach-heading-note">No silly questions. No need to be halfway through the book before you begin.</p>
+            </div>
+            <div className="coach-grid">
+              <CoachDemo />
+              <div className="feature-list">{features.map(({ icon: Icon, label, title, copy, tone }, index) => <article className={`feature-item motion-spotlight tilt-card ${tone}`} key={label}><div className="feature-number">0{index + 1}</div><div className="feature-icon"><Icon size={18} strokeWidth={1.8} /></div><div><span className="feature-label">{label}</span><h3>{title}</h3><p>{copy}</p></div><ArrowUpRight className="feature-arrow" size={17} /></article>)}</div>
+            </div>
+          </div>
+        </section>
+
+        <DailyQuote />
+
+        <section className="progress-section section-pad" id="your-progress">
+          <div className="section-container">
+            <div className="progress-heading">
+              <div><div className="section-index">03 <span>— KEEP YOUR BOOKMARK</span></div><p className="eyebrow">THE WIDER VIEW, WHEN YOU'RE READY</p><h2>Remember where<br /><em>you left off.</em></h2></div>
+              <div className="progress-blurb"><p>Your week isn't a score; it's a story. When you want the bigger picture, see your LeetCode and Codeforces practice in one gentle, illustrative view.</p><DemoBadge /></div>
+            </div>
+            <DashboardPreview />
+            <div className="progress-cards">
+              <div className="progress-insight-card motion-spotlight tilt-card"><div className="insight-top"><span className="insight-symbol"><Sparkles size={16} /></span><span className="insight-label">A PATTERN WORTH NOTICING</span><span className="insight-demo">DEMO</span></div><h3>You've been showing<br />up on <em>weekdays.</em></h3><p>That kind of consistency? It really does count.</p><div className="week-dots" aria-label="Fictional weekly activity heatmap">{heatmap.flatMap((row, r) => row.map((value, c) => <span key={`${r}-${c}`} className={`heat-level-${value}`} />))}</div><div className="weekday-labels"><span>WEEK 1</span><span>WEEK 2</span><span>WEEK 3</span><span>WEEK 4</span></div><span className="insight-foot">Illustrative activity · not live synced</span></div>
+              <LeaderboardPreview />
+            </div>
+            <div className="platform-note"><span className="platform-note-icon"><Code2 size={15} /></span><span><strong>A quiet shelf for two practice spaces.</strong> LeetCode + Codeforces, together when you choose to connect them.</span><span className="platform-note-tail">Made for your momentum <span>↗</span></span></div>
+          </div>
+        </section>
+
+        <section className="steps-section section-pad" id="explore">
+          <div className="section-container">
+            <div className="steps-top"><div><div className="section-index">04 <span>— YOUR PACE, YOUR PATH</span></div><p className="eyebrow">THERE'S NO RUSH TO THE LAST PAGE</p><h2>Every good story<br />starts somewhere.</h2></div><p className="steps-intro">A question. A new angle. A little more confidence.</p></div>
+            <div className="steps-grid">
+              <article className="step-card motion-spotlight tilt-card"><span className="step-no">01</span><span className="step-illustration step-bubble"><MessageCircle size={22} /></span><h3>Bring a question</h3><p>The one you're curious about, or the line you've read twice and still want to understand.</p></article><span className="step-connector">· · · · · →</span>
+              <article className="step-card motion-spotlight tilt-card"><span className="step-no">02</span><span className="step-illustration step-book"><BookOpen size={22} /></span><h3>Find another way in</h3><p>Try a hint, read a clear explanation, and let the pattern find its place.</p></article><span className="step-connector">· · · · · →</span>
+              <article className="step-card motion-spotlight tilt-card"><span className="step-no">03</span><span className="step-illustration step-sun">✳</span><h3>Keep your bookmark</h3><p>See the small bits of practice adding up, across the places you code.</p></article>
+            </div>
+            <div className="closing-card motion-spotlight tilt-card"><div className="closing-decoration" aria-hidden="true">✳</div><div><span className="closing-eyebrow">WHENEVER YOU'RE READY</span><h3>There's always<br /><em>another page.</em></h3><p>Take a breath, turn the page, and find a little more room to grow.</p></div><a className="button button-dark" href="#top">Back to the beginning <ArrowRight size={17} /></a><span className="closing-squiggle" aria-hidden="true">〰</span></div>
+          </div>
+        </section>
+      </main>
+
+      <footer className="site-footer"><div className="footer-main"><Brand inverse /><p>A little more clarity.<br />A lot more room to grow.</p><a href="#top" className="footer-top-link">Back to top <ArrowUpRight size={14} /></a></div><div className="footer-bottom"><span>© {new Date().getFullYear()} Re.think(). Made for the in-between moments.</span><span className="footer-disclaimer">Illustrative demo data · no live accounts connected</span><span className="footer-thought">Read gently. Keep going. <span>✳</span></span></div></footer>
+    </div>
+  );
+}
+
+export default App;

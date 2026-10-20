@@ -21,8 +21,9 @@ async def cleanup():
 async def test_knowledge_and_coach_api_flow():
     # 1. Seed problem and user
     prob_platform_id = f"8888_{uuid.uuid4().hex[:6]}"
+    external_id = f"ext_{uuid.uuid4().hex}"
     async with async_session_factory() as session:
-        user = User(username=f"coach_user_{uuid.uuid4().hex[:6]}")
+        user = User(username=f"coach_user_{uuid.uuid4().hex[:6]}", external_id=external_id)
         session.add(user)
 
         prob = Problem(
@@ -38,7 +39,7 @@ async def test_knowledge_and_coach_api_flow():
         user_id = user.id
         prob_id = prob.id
 
-    headers = {"X-API-Key": settings.api_key}
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": external_id}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         # 2. Extract knowledge via POST /api/knowledge/extract
         editorial_text = """

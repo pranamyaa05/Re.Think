@@ -8,6 +8,14 @@ from pydantic import BaseModel, ConfigDict
 # ── Users ─────────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
     username: str
+    external_id: Optional[str] = None
+
+
+class UserResolveRequest(BaseModel):
+    """OAuth identity to resolve to a backend user."""
+
+    external_id: str
+    username: Optional[str] = None
 
 
 class UserResponse(BaseModel):
@@ -15,6 +23,7 @@ class UserResponse(BaseModel):
 
     id: int
     username: str
+    external_id: str | None = None
     created_at: datetime
 
 
@@ -39,12 +48,44 @@ class PlatformLinkResponse(BaseModel):
     created_at: datetime
 
 
+class CoachSessionListItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    problem_id: int
+    problem_title: Optional[str] = None
+    current_level: int
+    coach_mode: str
+    outcome: str
+    started_at: datetime
+    last_activity_at: datetime
+
+
+class ReflectionListItem(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    date: str
+    content: str
+    metrics: dict
+    generated_at: Optional[datetime] = None
+
+
 class SyncTriggerResponse(BaseModel):
     status: str
     link_id: int
+    user_id: int
+    # What the platform actually returned vs. what was new to this database.
+    submissions_fetched: int
+    submissions_newly_inserted: int
+    contests_fetched: int
+    contests_newly_inserted: int
+    problems_upserted: int
+    # Backwards-compatible aliases for the old "synced" counters, which meant
+    # "newly inserted" and made a re-sync of existing data indistinguishable
+    # from an empty/failed fetch.
     submissions_synced: int
     contests_synced: int
-    problems_upserted: int
 
 
 # ── Submissions ───────────────────────────────────────────────────────

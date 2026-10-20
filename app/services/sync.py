@@ -38,6 +38,18 @@ class SyncAlreadyRunningError(Exception):
     pass
 
 
+def _profile_accepted_count(profile: Optional[Dict[str, Any]]) -> int:
+    """Reads the "All" accepted-submission count from a LeetCode matchedUser profile."""
+    stats = (profile or {}).get("submitStats") or {}
+    for item in stats.get("acSubmissionNum") or []:
+        if item.get("difficulty") == "All":
+            try:
+                return int(item.get("count") or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def _derive_leetcode_contest_id(title: str, start_time: int) -> int:
     """Derives a deterministic 32-bit positive integer contest ID for LeetCode contests."""
     match = re.search(r'(weekly|biweekly)\s+contest\s+(\d+)', title, re.IGNORECASE)
@@ -149,13 +161,25 @@ class CodeforcesSyncService:
 
         try:
             if platform == "leetcode":
-                synced_subs, synced_contests, upserted_problems = await self._sync_leetcode(
+                (
+                    subs_fetched,
+                    subs_inserted,
+                    contests_fetched,
+                    contests_inserted,
+                    upserted_problems,
+                ) = await self._sync_leetcode(
                     user_id=user_id,
                     handle=handle,
                     auth_token=auth_token,
                 )
             elif platform == "codeforces":
-                synced_subs, synced_contests, upserted_problems = await self._sync_codeforces(
+                (
+                    subs_fetched,
+                    subs_inserted,
+                    contests_fetched,
+                    contests_inserted,
+                    upserted_problems,
+                ) = await self._sync_codeforces(
                     user_id=user_id,
                     handle=handle,
                     force_full=force_full,
@@ -178,9 +202,18 @@ class CodeforcesSyncService:
                 logger.exception(f"Post-sync analytics rebuild failed for user {user_id}: {e}")
 
             return {
-                "submissions_synced": synced_subs,
-                "contests_synced": synced_contests,
+                # Distinguish what the platform returned from what was new to us.
+                # A re-sync of already-stored data is no longer ambiguous with an
+                # empty/failed fetch.
+                "user_id": user_id,
+                "submissions_fetched": subs_fetched,
+                "submissions_newly_inserted": subs_inserted,
+                "contests_fetched": contests_fetched,
+                "contests_newly_inserted": contests_inserted,
                 "problems_upserted": upserted_problems,
+                # Backwards-compatible aliases (previously meant "newly inserted").
+                "submissions_synced": subs_inserted,
+                "contests_synced": contests_inserted,
             }
 
         except Exception as exc:
@@ -196,19 +229,20 @@ class CodeforcesSyncService:
         handle: str,
         force_full: bool = False,
         max_pages: Optional[int] = None,
-    ) -> Tuple[int, int, int]:
+    ) -> Tuple[int, int, int, int, int]:
         # 1. Fetch user contest history from API (OUTSIDE DB transaction)
         raw_contests = await self.adapter.get_user_rating(handle)
+        contests_fetched = len(raw_contests)
 
         # 2. Synchronize submissions via stop-on-overlap pagination (OUTSIDE DB transaction per page)
-        synced_subs, upserted_problems = await self._sync_submissions(
+        subs_fetched, subs_inserted, upserted_problems = await self._sync_submissions(
             user_id, handle, max_pages=max_pages, check_overlap=not force_full
         )
 
         # 3. Persist contest performances (idempotent upsert)
-        synced_contests = await self._persist_contests(user_id, raw_contests)
+        contests_inserted = await self._persist_contests(user_id, raw_contests)
 
-        return synced_subs, synced_contests, upserted_problems
+        return subs_fetched, subs_inserted, contests_fetched, contests_inserted, upserted_problems
 
     async def _sync_submissions(
         self,
@@ -216,9 +250,10 @@ class CodeforcesSyncService:
         handle: str,
         max_pages: Optional[int] = None,
         check_overlap: bool = True,
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int]:
         page_size = settings.sync_page_size
         from_index = 1
+        total_fetched_subs = 0
         total_synced_subs = 0
         total_upserted_problems = 0
         page_count = 0
@@ -240,6 +275,7 @@ class CodeforcesSyncService:
             if not submissions_page:
                 break
 
+            total_fetched_subs += len(submissions_page)
             sub_ids = [sub["id"] for sub in submissions_page if "id" in sub]
             if not sub_ids:
                 break
@@ -278,7 +314,7 @@ class CodeforcesSyncService:
 
             from_index += len(submissions_page)
 
-        return total_synced_subs, total_upserted_problems
+        return total_fetched_subs, total_synced_subs, total_upserted_problems
 
     async def _upsert_problems_from_submissions(self, raw_submissions: List[Dict]) -> int:
         problems_map: Dict[str, Dict] = {}
@@ -425,14 +461,28 @@ class CodeforcesSyncService:
         user_id: int,
         handle: str,
         auth_token: Optional[str] = None,
-    ) -> Tuple[int, int, int]:
+    ) -> Tuple[int, int, int, int, int]:
         raw_token = decrypt_token(auth_token) if auth_token else None
 
-        # Auto-detect canonical username if session cookie is present
+        # A stored token that cannot be decrypted must not silently degrade into
+        # a public-only "successful" sync with zero submissions.
+        if auth_token and not raw_token:
+            raise LeetCodeAPIError(
+                "Stored LeetCode cookie could not be decrypted; re-link the account"
+            )
+
+        # Validate the session and resolve the canonical username before any fetch.
+        # This is the exact failure mode that used to produce 0/0/0 "completed"
+        # syncs: an expired cookie made get_authenticated_user() return None, and
+        # the adapter then queried the display name as if it were a username.
         if raw_token:
             auth_user = await self.leetcode_adapter.get_authenticated_user(raw_token)
-            if auth_user and auth_user.get("username") and auth_user["username"] != handle:
-                canonical = auth_user["username"]
+            if not auth_user or not auth_user.get("username"):
+                raise LeetCodeAPIError(
+                    "LeetCode cookie invalid or expired; re-link the account with a fresh session cookie"
+                )
+            canonical = auth_user["username"]
+            if canonical != handle:
                 logger.info(
                     f"Auto-correcting LeetCode handle for user {user_id}: '{handle}' -> '{canonical}'"
                 )
@@ -443,28 +493,52 @@ class CodeforcesSyncService:
                         {"h": canonical, "uid": user_id},
                     )
                     await session.commit()
+            profile = await self.leetcode_adapter.get_user_profile(
+                handle, auth_token=raw_token
+            )
         else:
             # Validate public user exists so typos/display names fail fast with clear message
-            await self.leetcode_adapter.get_user_profile(handle)
+            profile = await self.leetcode_adapter.get_user_profile(handle)
 
         # 1. Contest performances (publicly accessible)
         contest_data = await self.leetcode_adapter.get_user_contest_ranking(
             handle, auth_token=raw_token
         )
         history = contest_data.get("history") or []
-        synced_contests = await self._persist_leetcode_contests(user_id, history)
+        attended_history = [c for c in history if c.get("attended")]
+        contests_fetched = len(attended_history)
+        ranking = contest_data.get("ranking") or {}
+        attended_count = int(ranking.get("attendedContestsCount") or 0)
+        if contests_fetched == 0 and attended_count > 0:
+            raise LeetCodeAPIError(
+                f"LeetCode returned an empty contest history for '{handle}' "
+                f"even though its ranking reports {attended_count} attended contests"
+            )
+        contests_inserted = await self._persist_leetcode_contests(user_id, history)
 
         # 2. Submissions & Problems (only with auth_token cookie)
-        synced_subs = 0
+        subs_fetched = 0
+        subs_inserted = 0
         upserted_problems = 0
         if raw_token:
-            synced_subs, upserted_problems = await self._sync_leetcode_submissions(
+            (
+                subs_fetched,
+                subs_inserted,
+                upserted_problems,
+            ) = await self._sync_leetcode_submissions(
                 user_id=user_id,
                 handle=handle,
                 raw_token=raw_token,
+                profile=profile,
             )
 
-        return synced_subs, synced_contests, upserted_problems
+        return (
+            subs_fetched,
+            subs_inserted,
+            contests_fetched,
+            contests_inserted,
+            upserted_problems,
+        )
 
     async def _persist_leetcode_contests(
         self, user_id: int, raw_history: List[Dict]
@@ -516,23 +590,39 @@ class CodeforcesSyncService:
             return res.rowcount if res.rowcount is not None else len(records)
 
     async def _sync_leetcode_submissions(
-        self, user_id: int, handle: str, raw_token: str
-    ) -> Tuple[int, int]:
+        self, user_id: int, handle: str, raw_token: str, profile: Dict[str, Any]
+    ) -> Tuple[int, int, int]:
         recent_subs = await self.leetcode_adapter.get_recent_submissions(
             handle, limit=100, auth_token=raw_token
         )
-        if not recent_subs:
-            return 0, 0
+        fetched = len(recent_subs)
 
-        sub_ids = []
+        # An authenticated request that returns nothing is a failure, not a
+        # successful zero-row sync - unless the profile genuinely has no solves.
+        if fetched == 0:
+            accepted_total = _profile_accepted_count(profile)
+            if accepted_total > 0:
+                raise LeetCodeAPIError(
+                    f"LeetCode returned no recent submissions for authenticated user '{handle}' "
+                    f"although the profile reports {accepted_total} accepted submissions; "
+                    "cookie invalid or expired"
+                )
+            return 0, 0, 0
+
+        valid_subs: List[Tuple[int, Dict[str, Any]]] = []
+        sub_ids: List[int] = []
         for s in recent_subs:
             try:
-                sub_ids.append(int(s["id"]))
-            except (ValueError, TypeError):
+                sid = int(s["id"])
+            except (ValueError, TypeError, KeyError):
                 continue
+            valid_subs.append((sid, s))
+            sub_ids.append(sid)
 
         if not sub_ids:
-            return 0, 0
+            raise LeetCodeAPIError(
+                f"LeetCode returned {fetched} submissions for '{handle}' but none had usable IDs"
+            )
 
         # Check existing submissions in DB
         async with async_session_factory() as session:
@@ -545,9 +635,9 @@ class CodeforcesSyncService:
             )
             existing_ids: Set[int] = set(existing_res.scalars().all())
 
-        new_subs = [s for s in recent_subs if int(s["id"]) not in existing_ids]
+        new_subs = [s for sid, s in valid_subs if sid not in existing_ids]
         if not new_subs:
-            return 0, 0
+            return fetched, 0, 0
 
         # Step A: Upsert problems for new submissions
         total_upserted_problems = await self._upsert_leetcode_problems(new_subs)
@@ -555,7 +645,7 @@ class CodeforcesSyncService:
         # Step B: Insert submissions
         total_synced_subs = await self._persist_leetcode_submissions(user_id, new_subs)
 
-        return total_synced_subs, total_upserted_problems
+        return fetched, total_synced_subs, total_upserted_problems
 
     async def _upsert_leetcode_problems(self, raw_submissions: List[Dict]) -> int:
         slugs = list({s["titleSlug"] for s in raw_submissions if s.get("titleSlug")})

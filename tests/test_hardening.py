@@ -75,8 +75,9 @@ async def test_health_accessible_without_auth():
 async def test_coach_message_rate_limiting():
     """Two coach messages within 1s for same user triggers 429."""
     # Seed user, problem, knowledge, session
+    coach_external_id = f"ext_{uuid.uuid4().hex}"
     async with async_session_factory() as session:
-        user = User(username=f"rl_user_{uuid.uuid4().hex[:6]}")
+        user = User(username=f"rl_user_{uuid.uuid4().hex[:6]}", external_id=coach_external_id)
         session.add(user)
         prob = Problem(
             platform="codeforces",
@@ -109,7 +110,7 @@ async def test_coach_message_rate_limiting():
         session_id = hs.id
 
     reset_rate_limits()
-    headers = {"X-API-Key": settings.api_key}
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": coach_external_id}
 
     from unittest.mock import patch, AsyncMock
     from app.services.llm import LLMResponse
@@ -143,8 +144,9 @@ async def test_coach_message_rate_limiting():
 @pytest.mark.asyncio
 async def test_daily_llm_call_cap_blocks_and_no_new_log_row():
     """When daily LLM call cap is exceeded, returns 429 and creates NO new llm_call_log row."""
+    cap_external_id = f"ext_{uuid.uuid4().hex}"
     async with async_session_factory() as session:
-        user = User(username=f"cap_user_{uuid.uuid4().hex[:6]}")
+        user = User(username=f"cap_user_{uuid.uuid4().hex[:6]}", external_id=cap_external_id)
         session.add(user)
         prob = Problem(
             platform="codeforces",
@@ -192,7 +194,7 @@ async def test_daily_llm_call_cap_blocks_and_no_new_log_row():
         )).scalar()
 
     reset_rate_limits()
-    headers = {"X-API-Key": settings.api_key}
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": cap_external_id}
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
         res = await ac.post(

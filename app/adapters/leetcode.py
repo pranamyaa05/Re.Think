@@ -134,8 +134,14 @@ class LeetCodeAdapter:
                 except ValueError as exc:
                     raise LeetCodeAPIError(f"Invalid JSON returned by LeetCode API: {exc}") from exc
 
-                if isinstance(data, dict) and data.get("errors") and not data.get("data"):
-                    err_msg = "; ".join(e.get("message", "Unknown error") for e in data["errors"])
+                # GraphQL can return HTTP 200 with a top-level "errors" key.
+                # Always surface it, even when partial "data" is also present:
+                # otherwise invalid handles / expired sessions silently become
+                # empty result sets and get reported as a successful sync.
+                if isinstance(data, dict) and data.get("errors"):
+                    err_msg = "; ".join(
+                        e.get("message", "Unknown error") for e in data["errors"]
+                    )
                     raise LeetCodeAPIError(f"LeetCode GraphQL error: {err_msg}")
 
                 return data.get("data") or {}
@@ -145,7 +151,13 @@ class LeetCodeAdapter:
     async def get_authenticated_user(
         self, auth_token: str
     ) -> Optional[Dict[str, Any]]:
-        """Fetch authenticated user identity (username, realName, isSignedIn) from session cookie."""
+        """
+        Fetch authenticated user identity (username, realName, isSignedIn) from session cookie.
+
+        Returns None when LeetCode explicitly reports that the session is not signed in.
+        Network / HTTP / GraphQL failures are NOT swallowed: they propagate as
+        LeetCodeAPIError so callers can fail the sync loudly.
+        """
         query = """
         query globalData {
           userStatus {
@@ -156,15 +168,11 @@ class LeetCodeAdapter:
           }
         }
         """
-        try:
-            data = await self._post(query, auth_token=auth_token)
-            status = data.get("userStatus")
-            if status and status.get("isSignedIn"):
-                return status
-            return None
-        except Exception as e:
-            logger.warning(f"Could not verify authenticated user from cookie: {e}")
-            return None
+        data = await self._post(query, auth_token=auth_token)
+        status = data.get("userStatus")
+        if status and status.get("isSignedIn") and status.get("username"):
+            return status
+        return None
 
     async def get_user_profile(
         self, username: str, auth_token: Optional[str] = None
@@ -296,6 +304,10 @@ class LeetCodeAdapter:
           }
         }
         """
+        # Secondary enrichment query: the primary recentSubmissionList above is
+        # authoritative. If this optional query fails, keep the primary data but
+        # log the failure instead of silently pretending the combined fetch was
+        # complete.
         try:
             ac_data = await self._post(query_ac, {"username": username, "limit": limit}, auth_token=auth_token)
             raw_ac = ac_data.get("recentAcSubmissionList") or []
@@ -311,8 +323,8 @@ class LeetCodeAdapter:
                         "statusDisplay": "Accepted",
                         "lang": None,
                     })
-        except Exception as e:
-            logger.warning(f"Could not fetch recentAcSubmissionList: {e}")
+        except LeetCodeAPIError as e:
+            logger.warning(f"Could not fetch recentAcSubmissionList (optional): {e}")
 
         normalized_submissions = []
         for s in raw_list:

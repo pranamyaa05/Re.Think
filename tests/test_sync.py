@@ -92,7 +92,7 @@ async def test_first_sync_exceeding_10_pages():
     adapter = MockCodeforcesAdapter(mock_data)
     service = CodeforcesSyncService(adapter=adapter)
 
-    synced_count, problems_count = await service._sync_submissions(user_id, "tester")
+    fetched_count, synced_count, problems_count = await service._sync_submissions(user_id, "tester")
 
     assert synced_count == 1250
     # 12 full pages (100 each) + 1 short page (50 items) = 13 pages fetched
@@ -124,7 +124,7 @@ async def test_incremental_sync_stopping_on_overlap():
     initial_data = [make_submission(i) for i in range(200, 0, -1)]
     adapter1 = MockCodeforcesAdapter(initial_data)
     service1 = CodeforcesSyncService(adapter=adapter1)
-    synced1, _ = await service1._sync_submissions(user_id, "tester")
+    _, synced1, _ = await service1._sync_submissions(user_id, "tester")
     assert synced1 == 200
     assert len(adapter1.calls) == 3  # 2 full pages of 100 + 1 empty page (since 200 is exact multiple of 100)
 
@@ -133,7 +133,7 @@ async def test_incremental_sync_stopping_on_overlap():
     adapter2 = MockCodeforcesAdapter(updated_data)
     service2 = CodeforcesSyncService(adapter=adapter2)
 
-    synced2, _ = await service2._sync_submissions(user_id, "tester")
+    _, synced2, _ = await service2._sync_submissions(user_id, "tester")
 
     # Only the 5 new submissions should be synced
     assert synced2 == 5
@@ -164,7 +164,7 @@ async def test_final_short_page_termination():
     adapter = MockCodeforcesAdapter(short_data)
     service = CodeforcesSyncService(adapter=adapter)
 
-    synced, _ = await service._sync_submissions(user_id, "tester")
+    _, synced, _ = await service._sync_submissions(user_id, "tester")
 
     assert synced == 42
     # Only 1 call made; stopped because len(page) == 42 < 100
@@ -191,11 +191,11 @@ async def test_no_duplicate_submissions_after_repeated_sync():
     service = CodeforcesSyncService(adapter=adapter)
 
     # First sync
-    synced1, _ = await service._sync_submissions(user_id, "tester")
+    _, synced1, _ = await service._sync_submissions(user_id, "tester")
     assert synced1 == 50
 
     # Second sync (identical data)
-    synced2, _ = await service._sync_submissions(user_id, "tester")
+    _, synced2, _ = await service._sync_submissions(user_id, "tester")
     assert synced2 == 0
 
     # Exactly 1 call was made on the second sync (stopped on overlap)
@@ -232,7 +232,7 @@ async def test_infinite_loop_cycle_protection():
     adapter = BuggyCyclingAdapter()
     service = CodeforcesSyncService(adapter=adapter)
 
-    synced, _ = await service._sync_submissions(user_id, "tester")
+    _, synced, _ = await service._sync_submissions(user_id, "tester")
 
     assert synced == 100
     # Breaks on page 2 because all IDs were already seen in this sync run

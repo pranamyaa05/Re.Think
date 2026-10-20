@@ -28,9 +28,13 @@ async def test_health():
 @pytest.mark.asyncio
 async def test_create_and_get_user():
     username = f"cf_user_{uuid.uuid4().hex[:8]}"
-    headers = {"X-API-Key": settings.api_key}
+    external_id = f"ext_{uuid.uuid4().hex}"
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": external_id}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
-        res = await ac.post("/api/users", json={"username": username})
+        res = await ac.post(
+            "/api/users",
+            json={"username": username, "external_id": external_id},
+        )
         assert res.status_code == 201
         data = res.json()
         assert data["username"] == username
@@ -43,20 +47,29 @@ async def test_create_and_get_user():
 
 @pytest.mark.asyncio
 async def test_platform_link_and_status():
+    from unittest.mock import AsyncMock, patch
+
     username = f"link_user_{uuid.uuid4().hex[:8]}"
-    headers = {"X-API-Key": settings.api_key}
+    external_id = f"ext_{uuid.uuid4().hex}"
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": external_id}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
-        u_res = await ac.post("/api/users", json={"username": username})
+        u_res = await ac.post(
+            "/api/users",
+            json={"username": username, "external_id": external_id},
+        )
         assert u_res.status_code == 201
         user_id = u_res.json()["id"]
 
-        link_res = await ac.post(
-            "/api/platforms/link",
-            json={"user_id": user_id, "platform": "codeforces", "handle": "tourist"}
-        )
+        # Link creation must queue the sync and return immediately; the worker
+        # itself is stubbed so this contract test never calls a platform API.
+        with patch("app.routers.run_link_sync", new=AsyncMock()):
+            link_res = await ac.post(
+                "/api/platforms/link",
+                json={"user_id": user_id, "platform": "codeforces", "handle": "tourist"}
+            )
         assert link_res.status_code == 201
         link_id = link_res.json()["id"]
-        assert link_res.json()["sync_status"] == "idle"
+        assert link_res.json()["sync_status"] == "queued"
 
         st_res = await ac.get(f"/api/platforms/{link_id}/status")
         assert st_res.status_code == 200
@@ -66,9 +79,13 @@ async def test_platform_link_and_status():
 @pytest.mark.asyncio
 async def test_analytics_endpoints():
     username = f"analytics_user_{uuid.uuid4().hex[:8]}"
-    headers = {"X-API-Key": settings.api_key}
+    external_id = f"ext_{uuid.uuid4().hex}"
+    headers = {"X-API-Key": settings.api_key, "X-External-Id": external_id}
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test", headers=headers) as ac:
-        u_res = await ac.post("/api/users", json={"username": username})
+        u_res = await ac.post(
+            "/api/users",
+            json={"username": username, "external_id": external_id},
+        )
         assert u_res.status_code == 201
         user_id = u_res.json()["id"]
 
@@ -103,6 +120,6 @@ async def test_analytics_endpoints():
         assert cont_res.status_code == 200
         assert cont_res.json()["contest_count"] == 0
 
-        # 6. Non-existent user returns 404
+        # 6. Another user's id is rejected by the ownership check
         bad_res = await ac.get("/api/analytics/999999/summary")
-        assert bad_res.status_code == 404
+        assert bad_res.status_code == 403
